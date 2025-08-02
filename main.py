@@ -187,7 +187,7 @@ async def read_users_me(current_user: User = Depends(get_current_user)):
     return current_user
 
 # --- Endpoints de Eventos ---
-@events_router.post("", response_model=EventOut) # Ruta simplificada a ""
+@events_router.post("", response_model=EventOut)
 def create_event(event: EventCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     if current_user.role != UserRole.ORGANIZADOR:
         raise HTTPException(status_code=403, detail="Only organizers can create events")
@@ -204,6 +204,11 @@ def create_event(event: EventCreate, db: Session = Depends(get_db), current_user
     db.commit()
     db.refresh(new_event)
     return new_event
+
+@events_router.get("", response_model=list[EventOut])
+def get_all_events(db: Session = Depends(get_db)):
+    events = db.query(Event).all()
+    return events
 
 # Incluir routers en la app
 app.include_router(auth_router)
