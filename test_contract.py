@@ -1,0 +1,68 @@
+from web3 import Web3
+import json
+import os
+
+# Conectar a Ganache (asegúrate de que Ganache esté corriendo)
+w3 = Web3(Web3.HTTPProvider('http://127.0.0.1:8545'))
+
+if not w3.is_connected():
+    raise Exception("No se pudo conectar a Ganache. Asegúrate de que esté corriendo en http://127.0.0.1:8545")
+
+print("Conectado a Ganache.")
+
+# Cargar ABI y Bytecode del contrato TicketManager
+try:
+    with open("TicketManager.abi", "r") as f:
+        abi = json.load(f)
+    with open("TicketManager.bin", "r") as f:
+        bytecode = f.read()
+except FileNotFoundError:
+    print("ABI o Bytecode no encontrados. Asegúrate de haber compilado el contrato con compile_contract.py")
+    exit()
+
+# Obtener la cuenta de despliegue (primera cuenta de Ganache)
+deployer_account = w3.eth.accounts[0]
+print(f"Usando la cuenta de despliegue: {deployer_account}")
+
+# Crear el objeto contrato
+TicketManager = w3.eth.contract(abi=abi, bytecode=bytecode)
+
+# Construir la transacción de despliegue
+# Si tu constructor de TicketManager.sol requiere argumentos, pásalos aquí:
+# Por ejemplo: constructor_args = [arg1, arg2]
+# transaction = TicketManager.constructor(*constructor_args).build_transaction({
+transaction = TicketManager.constructor().build_transaction({
+    'from': deployer_account,
+    'nonce': w3.eth.get_transaction_count(deployer_account),
+    'gasPrice': w3.eth.gas_price
+})
+
+# Firmar la transacción
+signed_txn = w3.eth.account.sign_transaction(transaction, private_key="0x7b6a18f8210471946d334c53d59727ab6549f38409ef6cb7899eb5af7abdcb59") # Esto es solo para Ganache, en produccin usaras tu clave real
+
+# Enviar la transacción
+tx_hash = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
+print(f"Transacción de despliegue enviada. Hash: {tx_hash.hex()}")
+
+# Esperar a que la transacción sea minada y obtener el recibo
+tx_receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+contract_address = tx_receipt.contractAddress
+print(f"Contrato desplegado en la dirección: {contract_address}")
+
+# Guardar la dirección del contrato para usarla en main.py o en tests futuros
+# Puedes guardar esto en un archivo .env o directamente en una variable de entorno
+# Por ahora, lo imprimimos y puedes copiarlo
+print(f"Por favor, guarda esta dirección del contrato en tu .env como CONTRACT_ADDRESS: {contract_address}")
+
+# Interactuar con el contrato (ejemplo: llamar a una función)
+# Asegúrate de que tu contrato TicketManager.sol tenga una función `name()` o `symbol()` si es ERC721
+# contract_instance = w3.eth.contract(address=contract_address, abi=abi)
+# try:
+#     contract_name = contract_instance.functions.name().call()
+#     contract_symbol = contract_instance.functions.symbol().call()
+#     print(f"Nombre del contrato: {contract_name}")
+#     print(f"Símbolo del contrato: {contract_symbol}")
+# except Exception as e:
+#     print(f"Error al llamar a funciones del contrato (¿ERC721?): {e}")
+
+print("\nDespliegue y prueba básica completados.")

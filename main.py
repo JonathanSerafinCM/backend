@@ -14,7 +14,7 @@ from jose import JWTError, jwt
 from sqlalchemy.orm import relationship, declarative_base
 
 # Cargar variables de entorno
-load_dotenv(encoding='utf-8')
+load_dotenv(encoding='utf-8', override=True)
 
 # --- Configuración de la Base de Datos (PostgreSQL) ---
 DB_USER = os.getenv("DB_USER", "postgres")
@@ -105,6 +105,9 @@ class Token(BaseModel):
 
 class TokenData(BaseModel):
     email: str | None = None
+
+class TicketPurchase(BaseModel):
+    owner_address: str
 
 # --- Seguridad y Hashing ---
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -269,10 +272,13 @@ def delete_event(
 
 # --- Blockchain (Web3) Endpoints ---
 ALCHEMY_API_KEY = os.environ.get("ALCHEMY_API_KEY")
-if not ALCHEMY_API_KEY:
-    raise ValueError("No se ha configurado la ALCHEMY_API_KEY en las variables de entorno.")
 
-w3 = Web3(Web3.HTTPProvider(f"https://polygon-amoy.g.alchemy.com/v2/{ALCHEMY_API_KEY}"))
+def get_w3():
+    if not ALCHEMY_API_KEY:
+        raise ValueError("No se ha configurado la ALCHEMY_API_KEY en las variables de entorno.")
+    yield Web3(Web3.HTTPProvider(f"https://polygon-amoy.g.alchemy.com/v2/{ALCHEMY_API_KEY}"))
+
+w3_for_non_endpoints = Web3(Web3.HTTPProvider(f"https://polygon-amoy.g.alchemy.com/v2/{ALCHEMY_API_KEY}"))
 
 with open("TicketManager.abi", "r") as f:
     abi = json.load(f)
@@ -287,50 +293,85 @@ def get_contract_address():
     return contract_address
 
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY", "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d")
-ACCOUNT_ADDRESS = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+ACCOUNT_ADDRESS = "0x2e34f08f4326DC2dFF0e161cbe10949B8Ed922D8"
 
-@web3_router.post("/deploy")
-def deploy_contract():
-    if not PRIVATE_KEY:
-        raise HTTPException(status_code=500, detail="La clave privada no está configurada.")
+@events_router.post("/{event_id}/purchase", tags=["Blockchain"])
+def purchase_ticket(
+    event_id: int,
+    purchase_data: TicketPurchase,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    contract_address: str = Depends(get_contract_address),
+    w3: Web3 = Depends(get_w3)
+):
+    if current_user.role != UserRole.COMPRADOR:
+        raise HTTPException(status_code=403, detail="Only buyers can purchase tickets")
 
-    TicketManagerContract = w3.eth.contract(abi=abi, bytecode=bytecode)
-    nonce = w3.eth.get_transaction_count(ACCOUNT_ADDRESS)
-    constructor = TicketManagerContract.constructor()
-    gas_estimate = constructor.estimate_gas({'from': ACCOUNT_ADDRESS, 'nonce': nonce})
-    transaction = constructor.build_transaction({
-        'chainId': 80002,
-        'gas': gas_estimate,
-        'gasPrice': w3.eth.gas_price,
-        'nonce': nonce,
-    })
-    signed_txn = w3.eth.account.sign_transaction(transaction, private_key=PRIVATE_KEY)
-    tx_hash = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
-    tx_receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
-    return {"message": "Contrato desplegado", "contract_address": tx_receipt.contractAddress}
+    event = db.query(Event).filter(Event.id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
 
-@web3_router.post("/tickets")
-def create_ticket_endpoint(owner_address: str, contract_address: str = Depends(get_contract_address)):
+    if event.total_tickets <= 0:
+        raise HTTPException(status_code=400, detail="No tickets left for this event")
+
+    # Lógica de la blockchain
     contract = w3.eth.contract(address=contract_address, abi=abi)
     nonce = w3.eth.get_transaction_count(ACCOUNT_ADDRESS)
-    create_ticket_function = contract.functions.createTicket(owner_address)
-    gas_estimate = create_ticket_function.estimate_gas({'from': ACCOUNT_ADDRESS, 'nonce': nonce})
-    tx_data = create_ticket_function.build_transaction({
+    
+    # Crear URI para los metadatos del ticket
+    # En un caso real, esta URI apuntaría a un endpoint que devuelve un JSON con los metadatos
+    token_uri = f"https://api.ticketera.com/metadata/tickets/{event.id}"
+
+    mint_function = contract.functions.safeMint(purchase_data.owner_address, token_uri)
+    
+    gas_estimate = mint_function.estimate_gas({'from': ACCOUNT_ADDRESS, 'nonce': nonce})
+    tx_data = mint_function.build_transaction({
         'chainId': 80002,
         'gas': gas_estimate,
         'gasPrice': w3.eth.gas_price,
         'nonce': nonce,
     })
+
     signed_tx = w3.eth.account.sign_transaction(tx_data, private_key=PRIVATE_KEY)
     tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
     tx_receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
-    return {"message": "Ticket creado exitosamente", "transaction_hash": tx_hash.hex()}
 
-@web3_router.get("/tickets/{ticket_id}")
-def get_ticket_owner(ticket_id: int, contract_address: str = Depends(get_contract_address)):
+    # Actualizar la base de datos
+    event.total_tickets -= 1
+    db.commit()
+
+    # Obtener el ID del token del evento de la transacción
+    # Esto puede variar dependiendo de cómo tu contrato emite eventos
+    # Aquí asumimos que el evento Transfer emite el tokenId
+    # Buscamos el log del evento Transfer manualmente
+    transfer_event_abi = next((item for item in abi if item.get('type') == 'event' and item.get('name') == 'Transfer'), None)
+    if not transfer_event_abi:
+        raise HTTPException(status_code=500, detail="Transfer event not found in ABI")
+
+    transfer_event_signature = w3.keccak(text=f"Transfer(address,address,uint256)").hex()
+    transfer_log = next((log for log in tx_receipt.logs if log['topics'][0].hex() == transfer_event_signature), None)
+
+    if not transfer_log:
+        raise HTTPException(status_code=500, detail="Transfer event not found in transaction receipt")
+
+    processed_log = contract.events.Transfer().process_log(transfer_log)
+    ticket_id = processed_log['args']['tokenId']
+
+    return {
+        "message": "Ticket purchased and minted successfully", 
+        "transaction_hash": tx_hash.hex(),
+        "ticket_id": ticket_id
+    }
+
+@web3_router.get("/tickets/{ticket_id}", tags=["Blockchain"])
+def get_ticket_owner(ticket_id: int, contract_address: str = Depends(get_contract_address), w3: Web3 = Depends(get_w3)):
     contract = w3.eth.contract(address=contract_address, abi=abi)
-    owner = contract.functions.ticketOwners(ticket_id).call()
-    return {"ticket_id": ticket_id, "owner": owner}
+    try:
+        owner = contract.functions.ownerOf(ticket_id).call()
+        return {"ticket_id": ticket_id, "owner": owner}
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Ticket not found or error: {e}")
+
 
 @web3_router.get("/events/recommendations")
 def get_event_recommendations():
