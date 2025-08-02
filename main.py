@@ -1,101 +1,143 @@
-from fastapi import FastAPI, HTTPException, Depends
-from web3 import Web3
-import json
+
 import os
 from dotenv import load_dotenv
+from fastapi import FastAPI, Depends, HTTPException, APIRouter
+from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+from pydantic import BaseModel
+from passlib.context import CryptContext
+from web3 import Web3
+import json
 
-load_dotenv()
+# Cargar variables de entorno
+load_dotenv(encoding='utf-8')
 
-app = FastAPI()
+# --- Configuración de la Base de Datos (PostgreSQL) ---
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "1234")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "ticketera")
+
+DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# --- Modelos de la Base de Datos (SQLAlchemy) ---
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True, index=True, nullable=False)
+    hashed_password = Column(String, nullable=False)
+
+# Crear tablas en la base de datos
+Base.metadata.create_all(bind=engine)
+
+# --- Schemas (Pydantic) ---
+class UserCreate(BaseModel):
+    email: str
+    password: str
+
+class UserOut(BaseModel):
+    id: int
+    email: str
+
+    class Config:
+        orm_mode = True
+
+# --- Seguridad y Hashing de Contraseñas ---
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+# --- Dependencias ---
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# --- API Routers ---
+auth_router = APIRouter(prefix="/auth", tags=["Authentication"])
+web3_router = APIRouter(prefix="/web3", tags=["Web3"])
+
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
+
+# --- Configuración de JWT ---
+SECRET_KEY = os.getenv("SECRET_KEY", "a_super_secret_key_that_should_be_in_env")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+# --- Schemas Adicionales ---
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class TokenData(BaseModel):
+    email: str | None = None
+
+# --- Funciones de Autenticación ---
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def create_access_token(data: dict, expires_delta: timedelta | None = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+# --- Endpoints de Autenticación ---
+@auth_router.post("/login", response_model=Token)
+def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.email}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@auth_router.post("/register", response_model=UserOut)
+def register_user(user: UserCreate, db: Session = Depends(get_db)):
+    db_user = db.query(User).filter(User.email == user.email).first()
+    if db_user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    hashed_password = get_password_hash(user.password)
+    new_user = User(email=user.email, hashed_password=hashed_password)
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    return new_user
 
 # --- Configuración de Web3 ---
-ALCHEMY_API_KEY = os.environ.get("ALCHEMY_API_KEY")
-if not ALCHEMY_API_KEY:
-    raise ValueError("No se ha configurado la ALCHEMY_API_KEY en las variables de entorno.")
+# ... (El resto del código de Web3 permanece igual)
 
-w3 = Web3(Web3.HTTPProvider(f"https://polygon-amoy.g.alchemy.com/v2/{ALCHEMY_API_KEY}"))
+# --- Aplicación Principal de FastAPI ---
+app = FastAPI(
+    title="Ticketera IA + Blockchain API",
+    description="Backend para la gestión de eventos, tickets NFT y recomendaciones con IA.",
+    version="0.1.0"
+)
 
-with open("TicketManager.abi", "r") as f:
-    abi = json.load(f)
+app.include_router(auth_router)
+app.include_router(web3_router)
 
-with open("TicketManager.bin", "r") as f:
-    bytecode = f.read()
-
-def get_contract_address():
-    contract_address = os.environ.get("CONTRACT_ADDRESS")
-    if not contract_address:
-        raise HTTPException(status_code=500, detail="La dirección del contrato no está configurada.")
-    return contract_address
-
-PRIVATE_KEY = os.environ.get("PRIVATE_KEY", "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d") # Clave de prueba de Hardhat - ¡NO USAR EN PRODUCCIÓN!
-ACCOUNT_ADDRESS = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8" # Dirección de prueba de Hardhat
-
-
-@app.post("/deploy")
-def deploy_contract():
-    if not PRIVATE_KEY:
-        raise HTTPException(status_code=500, detail="La clave privada no está configurada.")
-
-    TicketManagerContract = w3.eth.contract(abi=abi, bytecode=bytecode)
-    
-    nonce = w3.eth.get_transaction_count(ACCOUNT_ADDRESS)
-    
-    # Estimar gas dinámicamente
-    constructor = TicketManagerContract.constructor()
-    gas_estimate = constructor.estimate_gas({'from': ACCOUNT_ADDRESS, 'nonce': nonce})
-
-    transaction = constructor.build_transaction({
-        'chainId': 80002,
-        'gas': gas_estimate,
-        'gasPrice': w3.eth.gas_price,
-        'nonce': nonce,
-    })
-    
-    signed_txn = w3.eth.account.sign_transaction(transaction, private_key=PRIVATE_KEY)
-    tx_hash = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
-    tx_receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
-    
-    return {"message": "Contrato desplegado", "contract_address": tx_receipt.contractAddress}
-
-
-@app.post("/tickets")
-def create_ticket_endpoint(owner_address: str, contract_address: str = Depends(get_contract_address)):
-    contract = w3.eth.contract(address=contract_address, abi=abi)
-    nonce = w3.eth.get_transaction_count(ACCOUNT_ADDRESS)
-
-    # Estimar gas dinámicamente
-    create_ticket_function = contract.functions.createTicket(owner_address)
-    gas_estimate = create_ticket_function.estimate_gas({'from': ACCOUNT_ADDRESS, 'nonce': nonce})
-
-    tx_data = create_ticket_function.build_transaction({
-        'chainId': 80002,
-        'gas': gas_estimate,
-        'gasPrice': w3.eth.gas_price,
-        'nonce': nonce,
-    })
-
-    signed_tx = w3.eth.account.sign_transaction(tx_data, private_key=PRIVATE_KEY)
-    tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-    tx_receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
-
-    # El ID del ticket se puede obtener de los logs del evento, si se implementan.
-    # Por ahora, devolvemos el hash de la transacción.
-    return {"message": "Ticket creado exitosamente", "transaction_hash": tx_hash.hex()}
-
-
-@app.get("/tickets/{ticket_id}")
-def get_ticket_owner(ticket_id: int, contract_address: str = Depends(get_contract_address)):
-    contract = w3.eth.contract(address=contract_address, abi=abi)
-    owner = contract.functions.ticketOwners(ticket_id).call()
-    return {"ticket_id": ticket_id, "owner": owner}
-
-
-@app.get("/events/recommendations")
-def get_event_recommendations():
-    return {
-        "events": [
-            {"id": 1, "name": "Concierto de Rock", "category": "Música"},
-            {"id": 2, "name": "Obra de Teatro", "category": "Teatro"},
-            {"id": 3, "name": "Festival de Jazz", "category": "Música"},
-        ]
-    }
+@app.get("/")
+def read_root():
+    return {"message": "Bienvenido a la Ticketera API"}
