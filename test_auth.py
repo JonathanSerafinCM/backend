@@ -24,7 +24,7 @@ def test_read_users_me():
 
     # Llama al endpoint protegido
     headers = {"Authorization": f"Bearer {token}"}
-    response = client.get("/users/me", headers=headers)
+    response = client.get("/auth/users/me", headers=headers)
     
     assert response.status_code == 200, response.text
     data = response.json()
