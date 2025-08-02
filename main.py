@@ -1,17 +1,19 @@
 import os
 import enum
-from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, HTTPException, APIRouter
-from sqlalchemy import create_engine, Column, Integer, String, Enum, Float, DateTime, ForeignKey
-from sqlalchemy.orm import sessionmaker, Session
-from pydantic import BaseModel
-from passlib.context import CryptContext
-from web3 import Web3
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+
+from dotenv import load_dotenv
+
+from fastapi import Depends, FastAPI, HTTPException, APIRouter
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
-from sqlalchemy.orm import relationship, declarative_base
+from passlib.context import CryptContext
+from pydantic import BaseModel
+from sqlalchemy import (Column, create_engine, DateTime, Enum, Float,
+                        ForeignKey, Integer, String)
+from sqlalchemy.orm import declarative_base, relationship, sessionmaker, Session
+from web3 import Web3
 
 # Cargar variables de entorno
 load_dotenv(encoding='utf-8', override=True)
@@ -39,6 +41,7 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
+    wallet_address = Column(String, unique=True, index=True, nullable=True)
     role = Column(Enum(UserRole), default=UserRole.COMPRADOR, nullable=False)
     events = relationship("Event", back_populates="owner")
 
@@ -54,15 +57,6 @@ class Event(Base):
     owner_id = Column(Integer, ForeignKey("users.id"))
     owner = relationship("User", back_populates="events")
 
-    def __init__(self, name, description, date, location, price, total_tickets, owner):
-        self.name = name
-        self.description = description
-        self.date = date
-        self.location = location
-        self.price = price
-        self.total_tickets = total_tickets
-        self.owner = owner
-
 # Crear tablas en la base de datos
 Base.metadata.create_all(bind=engine)
 
@@ -70,13 +64,15 @@ Base.metadata.create_all(bind=engine)
 class UserCreate(BaseModel):
     email: str
     password: str
+    wallet_address: str | None = None
 
 class UserOut(BaseModel):
     id: int
     email: str
     role: UserRole
+    wallet_address: str | None = None
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 class EventCreate(BaseModel):
     name: str
@@ -89,7 +85,7 @@ class EventCreate(BaseModel):
 class EventOut(EventCreate):
     id: int
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 class EventUpdate(BaseModel):
     name: str | None = None
@@ -105,9 +101,6 @@ class Token(BaseModel):
 
 class TokenData(BaseModel):
     email: str | None = None
-
-class TicketPurchase(BaseModel):
-    owner_address: str
 
 # --- Seguridad y Hashing ---
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -125,9 +118,9 @@ def verify_password(plain_password, hashed_password):
 def create_access_token(data: dict, expires_delta: timedelta | None = None):
     to_encode = data.copy()
     if expires_delta:
-        expire = datetime.utcnow() + expires_delta
+        expire = datetime.now(timezone.utc) + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=15)
+        expire = datetime.now(timezone.utc) + timedelta(minutes=15)
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
@@ -169,7 +162,7 @@ app = FastAPI(
 # --- Routers ---
 auth_router = APIRouter(prefix="/auth", tags=["Authentication"])
 events_router = APIRouter(prefix="/events", tags=["Events"])
-web3_router = APIRouter(tags=["Web3"])
+web3_router = APIRouter(prefix="/tickets", tags=["Blockchain"])
 
 # --- Endpoints de Autenticación ---
 @auth_router.post("/register", response_model=UserOut)
@@ -178,7 +171,12 @@ def register_user(user: UserCreate, db: Session = Depends(get_db)):
     if db_user:
         raise HTTPException(status_code=400, detail="Email already registered")
     hashed_password = get_password_hash(user.password)
-    new_user = User(email=user.email, hashed_password=hashed_password, role=UserRole.COMPRADOR)
+    new_user = User(
+        email=user.email, 
+        hashed_password=hashed_password, 
+        wallet_address=user.wallet_address, 
+        role=UserRole.COMPRADOR
+    )
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
@@ -197,20 +195,49 @@ def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db:
 async def read_users_me(current_user: User = Depends(get_current_user)):
     return current_user
 
+@auth_router.get("/users/me/tickets", tags=["Blockchain"])
+def get_my_tickets(
+    current_user: User = Depends(get_current_user),
+    contract_address: str = Depends(lambda: get_contract_address()),
+    w3: Web3 = Depends(lambda: get_w3())
+):
+    if not current_user.wallet_address:
+        raise HTTPException(status_code=400, detail="User does not have a wallet address registered.")
+
+    contract = w3.eth.contract(address=contract_address, abi=abi)
+    
+    try:
+        balance = contract.functions.balanceOf(current_user.wallet_address).call()
+        if balance == 0:
+            return []
+
+        tickets = []
+        for i in range(balance):
+            ticket_id = contract.functions.tokenOfOwnerByIndex(current_user.wallet_address, i).call()
+            owner = contract.functions.ownerOf(ticket_id).call()
+            tickets.append({"ticket_id": ticket_id, "owner": owner})
+            
+        return tickets
+    except Exception as e:
+        print(f"Error fetching tickets from blockchain: {e}")
+        raise HTTPException(status_code=500, detail="Could not fetch tickets from the blockchain.")
+
 # --- Endpoints de Eventos ---
+@events_router.get("/recommendations", tags=["AI"])
+def get_event_recommendations():
+    return {
+        "events": [
+            {"id": 1, "name": "Concierto de Rock", "category": "Música"},
+            {"id": 2, "name": "Obra de Teatro", "category": "Teatro"},
+            {"id": 3, "name": "Festival de Jazz", "category": "Música"},
+        ]
+    }
+
 @events_router.post("", response_model=EventOut)
 def create_event(event: EventCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     if current_user.role != UserRole.ORGANIZADOR:
         raise HTTPException(status_code=403, detail="Only organizers can create events")
-    new_event = Event(
-        name=event.name,
-        description=event.description,
-        date=event.date,
-        location=event.location,
-        price=event.price,
-        total_tickets=event.total_tickets,
-        owner=current_user
-    )
+    new_event = Event(**event.model_dump(), owner=current_user)
     db.add(new_event)
     db.commit()
     db.refresh(new_event)
@@ -243,7 +270,7 @@ def update_event(
     if event.owner_id != current_user.id or current_user.role != UserRole.ORGANIZADOR:
         raise HTTPException(status_code=403, detail="Not authorized to update this event")
 
-    update_data = event_update.dict(exclude_unset=True)
+    update_data = event_update.model_dump(exclude_unset=True)
     for key, value in update_data.items():
         setattr(event, key, value)
     
@@ -269,40 +296,13 @@ def delete_event(
     db.commit()
     return {"detail": "Event deleted successfully"}
 
-
-# --- Blockchain (Web3) Endpoints ---
-ALCHEMY_API_KEY = os.environ.get("ALCHEMY_API_KEY")
-
-def get_w3():
-    if not ALCHEMY_API_KEY:
-        raise ValueError("No se ha configurado la ALCHEMY_API_KEY en las variables de entorno.")
-    yield Web3(Web3.HTTPProvider(f"https://polygon-amoy.g.alchemy.com/v2/{ALCHEMY_API_KEY}"))
-
-w3_for_non_endpoints = Web3(Web3.HTTPProvider(f"https://polygon-amoy.g.alchemy.com/v2/{ALCHEMY_API_KEY}"))
-
-with open("TicketManager.abi", "r") as f:
-    abi = json.load(f)
-
-with open("TicketManager.bin", "r") as f:
-    bytecode = f.read()
-
-def get_contract_address():
-    contract_address = os.environ.get("CONTRACT_ADDRESS")
-    if not contract_address:
-        raise HTTPException(status_code=500, detail="La dirección del contrato no está configurada.")
-    return contract_address
-
-PRIVATE_KEY = os.environ.get("PRIVATE_KEY", "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d")
-ACCOUNT_ADDRESS = "0x2e34f08f4326DC2dFF0e161cbe10949B8Ed922D8"
-
 @events_router.post("/{event_id}/purchase", tags=["Blockchain"])
 def purchase_ticket(
     event_id: int,
-    purchase_data: TicketPurchase,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
-    contract_address: str = Depends(get_contract_address),
-    w3: Web3 = Depends(get_w3)
+    contract_address: str = Depends(lambda: get_contract_address()),
+    w3: Web3 = Depends(lambda: get_w3())
 ):
     if current_user.role != UserRole.COMPRADOR:
         raise HTTPException(status_code=403, detail="Only buyers can purchase tickets")
@@ -314,21 +314,21 @@ def purchase_ticket(
     if event.total_tickets <= 0:
         raise HTTPException(status_code=400, detail="No tickets left for this event")
 
-    # Lógica de la blockchain
+    if not current_user.wallet_address:
+        raise HTTPException(status_code=400, detail="User does not have a wallet address registered.")
+
     contract = w3.eth.contract(address=contract_address, abi=abi)
     nonce = w3.eth.get_transaction_count(ACCOUNT_ADDRESS)
     
-    # Crear URI para los metadatos del ticket
-    # En un caso real, esta URI apuntaría a un endpoint que devuelve un JSON con los metadatos
     token_uri = f"https://api.ticketera.com/metadata/tickets/{event.id}"
-
-    mint_function = contract.functions.safeMint(purchase_data.owner_address, token_uri)
+    mint_function = contract.functions.safeMint(current_user.wallet_address, token_uri)
     
     gas_estimate = mint_function.estimate_gas({'from': ACCOUNT_ADDRESS, 'nonce': nonce})
     tx_data = mint_function.build_transaction({
-        'chainId': 80002,
+        'from': ACCOUNT_ADDRESS,
+        'chainId': 1337,
         'gas': gas_estimate,
-        'gasPrice': w3.eth.gas_price,
+        'gasPrice': w3.to_wei(20, 'gwei'),
         'nonce': nonce,
     })
 
@@ -336,26 +336,16 @@ def purchase_ticket(
     tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
     tx_receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
 
-    # Actualizar la base de datos
     event.total_tickets -= 1
     db.commit()
 
-    # Obtener el ID del token del evento de la transacción
-    # Esto puede variar dependiendo de cómo tu contrato emite eventos
-    # Aquí asumimos que el evento Transfer emite el tokenId
-    # Buscamos el log del evento Transfer manualmente
-    transfer_event_abi = next((item for item in abi if item.get('type') == 'event' and item.get('name') == 'Transfer'), None)
-    if not transfer_event_abi:
-        raise HTTPException(status_code=500, detail="Transfer event not found in ABI")
+    transfer_events = contract.events.Transfer.process_receipt(tx_receipt)
+    mint_event = next((e for e in transfer_events if e['args']['from'] == "0x0000000000000000000000000000000000000000"), None)
 
-    transfer_event_signature = w3.keccak(text=f"Transfer(address,address,uint256)").hex()
-    transfer_log = next((log for log in tx_receipt.logs if log['topics'][0].hex() == transfer_event_signature), None)
+    if not mint_event:
+        raise HTTPException(status_code=500, detail="Minting Transfer event not found in transaction receipt")
 
-    if not transfer_log:
-        raise HTTPException(status_code=500, detail="Transfer event not found in transaction receipt")
-
-    processed_log = contract.events.Transfer().process_log(transfer_log)
-    ticket_id = processed_log['args']['tokenId']
+    ticket_id = mint_event['args']['tokenId']
 
     return {
         "message": "Ticket purchased and minted successfully", 
@@ -363,7 +353,25 @@ def purchase_ticket(
         "ticket_id": ticket_id
     }
 
-@web3_router.get("/tickets/{ticket_id}", tags=["Blockchain"])
+# --- Blockchain (Web3) ---
+def get_w3():
+    return Web3(Web3.HTTPProvider("http://127.0.0.1:8545"))
+
+with open("TicketManager.abi", "r") as f:
+    abi = json.load(f)
+
+def get_contract_address():
+    contract_address = os.environ.get("CONTRACT_ADDRESS")
+    if not contract_address:
+        raise HTTPException(status_code=500, detail="La dirección del contrato no está configurada.")
+    return contract_address
+
+PRIVATE_KEY = os.getenv("PRIVATE_KEY")
+if not PRIVATE_KEY:
+    raise ValueError("No PRIVATE_KEY set for the application")
+ACCOUNT_ADDRESS = Web3().eth.account.from_key(PRIVATE_KEY).address
+
+@web3_router.get("/{ticket_id}/owner")
 def get_ticket_owner(ticket_id: int, contract_address: str = Depends(get_contract_address), w3: Web3 = Depends(get_w3)):
     contract = w3.eth.contract(address=contract_address, abi=abi)
     try:
@@ -372,16 +380,32 @@ def get_ticket_owner(ticket_id: int, contract_address: str = Depends(get_contrac
     except Exception as e:
         raise HTTPException(status_code=404, detail=f"Ticket not found or error: {e}")
 
+@web3_router.get("/{ticket_id}/history")
+def get_ticket_history(ticket_id: int, contract_address: str = Depends(get_contract_address), w3: Web3 = Depends(get_w3)):
+    contract = w3.eth.contract(address=contract_address, abi=abi)
+    try:
+        transfer_event_filter = contract.events.Transfer.create_filter(
+            from_block='earliest',
+            argument_filters={'tokenId': ticket_id}
+        )
+        logs = transfer_event_filter.get_all_entries()
+        
+        if not logs:
+             raise HTTPException(status_code=404, detail="No history found for this ticket.")
 
-@web3_router.get("/events/recommendations")
-def get_event_recommendations():
-    return {
-        "events": [
-            {"id": 1, "name": "Concierto de Rock", "category": "Música"},
-            {"id": 2, "name": "Obra de Teatro", "category": "Teatro"},
-            {"id": 3, "name": "Festival de Jazz", "category": "Música"},
-        ]
-    }
+        history = []
+        for log in logs:
+            event = log['args']
+            history.append({
+                "from": event["from"],
+                "to": event["to"],
+                "blockNumber": log["blockNumber"],
+                "transactionHash": log["transactionHash"].hex()
+            })
+        return {"ticket_id": ticket_id, "history": history}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error retrieving ticket history: {e}")
+
 
 # Incluir routers en la app
 app.include_router(auth_router)

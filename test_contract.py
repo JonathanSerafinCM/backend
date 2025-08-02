@@ -1,6 +1,12 @@
+
 from web3 import Web3
 import json
 import os
+from dotenv import load_dotenv
+
+
+# Cargar variables de entorno
+load_dotenv(encoding='utf-8', override=True)
 
 # Conectar a Ganache (asegúrate de que Ganache esté corriendo)
 w3 = Web3(Web3.HTTPProvider('http://127.0.0.1:8545'))
@@ -20,8 +26,10 @@ except FileNotFoundError:
     print("ABI o Bytecode no encontrados. Asegúrate de haber compilado el contrato con compile_contract.py")
     exit()
 
-# Obtener la cuenta de despliegue (primera cuenta de Ganache)
-deployer_account = w3.eth.accounts[0]
+
+# Obtener la clave privada y derivar la dirección pública
+PRIVATE_KEY = os.getenv("PRIVATE_KEY")
+deployer_account = w3.eth.account.from_key(PRIVATE_KEY).address
 print(f"Usando la cuenta de despliegue: {deployer_account}")
 
 # Crear el objeto contrato
@@ -37,8 +45,9 @@ transaction = TicketManager.constructor().build_transaction({
     'gasPrice': w3.eth.gas_price
 })
 
+
 # Firmar la transacción
-signed_txn = w3.eth.account.sign_transaction(transaction, private_key="0x7b6a18f8210471946d334c53d59727ab6549f38409ef6cb7899eb5af7abdcb59") # Esto es solo para Ganache, en produccin usaras tu clave real
+signed_txn = w3.eth.account.sign_transaction(transaction, private_key=PRIVATE_KEY)
 
 # Enviar la transacción
 tx_hash = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
