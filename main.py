@@ -91,6 +91,14 @@ class EventOut(EventCreate):
     class Config:
         orm_mode = True
 
+class EventUpdate(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    date: datetime | None = None
+    location: str | None = None
+    price: float | None = None
+    total_tickets: int | None = None
+
 class Token(BaseModel):
     access_token: str
     token_type: str
@@ -209,6 +217,54 @@ def create_event(event: EventCreate, db: Session = Depends(get_db), current_user
 def get_all_events(db: Session = Depends(get_db)):
     events = db.query(Event).all()
     return events
+
+@events_router.get("/{event_id}", response_model=EventOut)
+def get_event_by_id(event_id: int, db: Session = Depends(get_db)):
+    event = db.query(Event).filter(Event.id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    return event
+
+@events_router.put("/{event_id}", response_model=EventOut)
+def update_event(
+    event_id: int, 
+    event_update: EventUpdate, 
+    db: Session = Depends(get_db), 
+    current_user: User = Depends(get_current_user)
+):
+    event = db.query(Event).filter(Event.id == event_id).first()
+
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    if event.owner_id != current_user.id or current_user.role != UserRole.ORGANIZADOR:
+        raise HTTPException(status_code=403, detail="Not authorized to update this event")
+
+    update_data = event_update.dict(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(event, key, value)
+    
+    db.commit()
+    db.refresh(event)
+    return event
+
+@events_router.delete("/{event_id}")
+def delete_event(
+    event_id: int, 
+    db: Session = Depends(get_db), 
+    current_user: User = Depends(get_current_user)
+):
+    event = db.query(Event).filter(Event.id == event_id).first()
+
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    if event.owner_id != current_user.id or current_user.role != UserRole.ORGANIZADOR:
+        raise HTTPException(status_code=403, detail="Not authorized to delete this event")
+
+    db.delete(event)
+    db.commit()
+    return {"detail": "Event deleted successfully"}
 
 
 # --- Blockchain (Web3) Endpoints ---
