@@ -11,7 +11,7 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel
 from sqlalchemy import (Column, create_engine, DateTime, Enum, Float,
-                        ForeignKey, Integer, String)
+                        ForeignKey, Integer, String, func)
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker, Session
 from web3 import Web3
 
@@ -177,6 +177,7 @@ auth_router = APIRouter(prefix="/auth", tags=["Authentication"])
 events_router = APIRouter(prefix="/events", tags=["Events"])
 web3_router = APIRouter(prefix="/tickets", tags=["Blockchain"])
 metadata_router = APIRouter(prefix="/metadata", tags=["Metadata"])
+admin_router = APIRouter(prefix="/admin", tags=["Admin"])
 
 # --- Endpoints de Autenticación ---
 @auth_router.post("/register", response_model=UserOut)
@@ -237,15 +238,16 @@ def get_my_tickets(
         raise HTTPException(status_code=500, detail="Could not fetch tickets from the blockchain.")
 
 # --- Endpoints de Eventos ---
-@events_router.get("/recommendations", tags=["AI"])
-def get_event_recommendations():
-    return {
-        "events": [
-            {"id": 1, "name": "Concierto de Rock", "category": "Música"},
-            {"id": 2, "name": "Obra de Teatro", "category": "Teatro"},
-            {"id": 3, "name": "Festival de Jazz", "category": "Música"},
-        ]
-    }
+@events_router.get("/recommendations", tags=["AI"], response_model=list[EventOut])
+def get_event_recommendations(event_id: int | None = None, db: Session = Depends(get_db)):
+    if event_id:
+        event = db.query(Event).filter(Event.id == event_id).first()
+        if not event:
+            raise HTTPException(status_code=404, detail="Event not found")
+        recommendations = db.query(Event).filter(Event.category == event.category, Event.id != event_id).all()
+    else:
+        recommendations = db.query(Event).all()
+    return recommendations
 
 @events_router.post("", response_model=EventOut)
 def create_event(event: EventCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -457,11 +459,24 @@ def get_ticket_metadata(ticket_id: int, db: Session = Depends(get_db)):
     }
     return metadata
 
+@admin_router.get("/analytics/sales-by-category")
+def get_sales_by_category(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    if current_user.role != UserRole.ORGANIZADOR:
+        raise HTTPException(status_code=403, detail="Not authorized to access analytics")
+
+    sales_data = db.query(
+        Event.category,
+        func.count(Ticket.id).label("tickets_sold")
+    ).join(Ticket, Event.id == Ticket.event_id).group_by(Event.category).all()
+
+    return [{"category": category, "tickets_sold": tickets_sold} for category, tickets_sold in sales_data]
+
 # Incluir routers en la app
 app.include_router(auth_router)
 app.include_router(events_router)
 app.include_router(web3_router)
 app.include_router(metadata_router)
+app.include_router(admin_router)
 
 @app.get("/")
 def read_root():

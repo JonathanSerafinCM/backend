@@ -23,14 +23,14 @@ def test_get_event_recommendations_by_category():
     # Test recommendations for a specific event (Event1 - Música)
     response = client.get(f"/events/recommendations?event_id={event1['id']}")
     assert response.status_code == 200
-    recommendations = response.json()["events"]
+    recommendations = response.json()
     assert len(recommendations) == 1  # Only event2 should be recommended
     assert recommendations[0]["id"] == event2["id"]
 
     # Test recommendations without a specific event_id (should return all events)
     response_all = client.get("/events/recommendations")
     assert response_all.status_code == 200
-    recommendations_all = response_all.json()["events"]
+    recommendations_all = response_all.json()
     assert len(recommendations_all) == 3 # All events should be returned
 
     db.close()

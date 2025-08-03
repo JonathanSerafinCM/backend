@@ -181,5 +181,4 @@ def test_get_event_recommendations():
     response = client.get("/events/recommendations")
     assert response.status_code == 200
     data = response.json()
-    assert "events" in data
-    assert isinstance(data["events"], list)
+    assert isinstance(data, list)
