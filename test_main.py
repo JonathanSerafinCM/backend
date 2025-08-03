@@ -1,10 +1,34 @@
 import pytest
 import os
 from fastapi.testclient import TestClient
-from main import app, UserRole, get_db, User, Event, get_w3, SessionLocal
+from main import app, UserRole, get_db, User, Event, Ticket, get_w3, SessionLocal, Base, engine, get_password_hash
 from test_auth import random_string
 from sqlalchemy.orm import Session
 from web3 import Web3
+
+def setup_database(db):
+    Base.metadata.drop_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
+
+    # Create a default organizer user
+    organizer_email = "organizer@test.com"
+    organizer_password = "testpassword"
+    hashed_password = get_password_hash(organizer_password)
+    organizer_user = User(
+        email=organizer_email,
+        hashed_password=hashed_password,
+        role=UserRole.ORGANIZADOR
+    )
+    db.add(organizer_user)
+    db.commit()
+    db.refresh(organizer_user)
+
+def get_test_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 # Override the get_w3 dependency for testing
 def get_w3_override():
@@ -67,10 +91,12 @@ def db_session():
 
 @pytest.fixture(scope='function', autouse=True)
 def clean_db(db_session):
+    setup_database(db_session)
+    yield
+    db_session.query(Ticket).delete()
     db_session.query(Event).delete()
     db_session.query(User).delete()
     db_session.commit()
-    yield
 
 # --- Tests de Blockchain ---
 

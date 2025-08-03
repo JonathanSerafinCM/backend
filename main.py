@@ -54,8 +54,18 @@ class Event(Base):
     location = Column(String, nullable=False)
     price = Column(Float, nullable=False)
     total_tickets = Column(Integer, nullable=False)
+    category = Column(String, nullable=True) # Nueva columna para la categoría
     owner_id = Column(Integer, ForeignKey("users.id"))
     owner = relationship("User", back_populates="events")
+    tickets = relationship("Ticket", back_populates="event") # Relación con tickets
+
+class Ticket(Base):
+    __tablename__ = "tickets"
+    id = Column(Integer, primary_key=True, index=True)
+    ticket_id_onchain = Column(Integer, unique=True, index=True, nullable=False)
+    event_id = Column(Integer, ForeignKey("events.id"))
+    owner_wallet_address = Column(String, nullable=False)
+    event = relationship("Event", back_populates="tickets")
 
 # Crear tablas en la base de datos
 Base.metadata.create_all(bind=engine)
@@ -81,9 +91,11 @@ class EventCreate(BaseModel):
     location: str
     price: float
     total_tickets: int
+    category: str | None = None
 
 class EventOut(EventCreate):
     id: int
+    category: str | None = None
     class Config:
         from_attributes = True
 
@@ -94,6 +106,7 @@ class EventUpdate(BaseModel):
     location: str | None = None
     price: float | None = None
     total_tickets: int | None = None
+    category: str | None = None
 
 class Token(BaseModel):
     access_token: str
@@ -163,6 +176,7 @@ app = FastAPI(
 auth_router = APIRouter(prefix="/auth", tags=["Authentication"])
 events_router = APIRouter(prefix="/events", tags=["Events"])
 web3_router = APIRouter(prefix="/tickets", tags=["Blockchain"])
+metadata_router = APIRouter(prefix="/metadata", tags=["Metadata"])
 
 # --- Endpoints de Autenticación ---
 @auth_router.post("/register", response_model=UserOut)
@@ -348,6 +362,16 @@ def purchase_ticket(
 
     ticket_id = mint_event['args']['tokenId']
 
+    # Guardar el ticket en la base de datos
+    new_ticket_db = Ticket(
+        ticket_id_onchain=ticket_id,
+        event_id=event.id,
+        owner_wallet_address=current_user.wallet_address
+    )
+    db.add(new_ticket_db)
+    db.commit()
+    db.refresh(new_ticket_db)
+
     return {
         "message": "Ticket purchased and minted successfully", 
         "transaction_hash": tx_hash.hex(),
@@ -408,10 +432,36 @@ def get_ticket_history(ticket_id: int, contract_address: str = Depends(get_contr
         raise HTTPException(status_code=500, detail=f"Error retrieving ticket history: {e}")
 
 
+@metadata_router.get("/tickets/{ticket_id}", tags=["Metadata"])
+def get_ticket_metadata(ticket_id: int, db: Session = Depends(get_db)):
+    ticket = db.query(Ticket).filter(Ticket.ticket_id_onchain == ticket_id).first()
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket metadata not found")
+
+    event = db.query(Event).filter(Event.id == ticket.event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found for this ticket")
+
+    metadata = {
+        "name": event.name,
+        "description": event.description,
+        "image": "https://example.com/ticket_image.png", # Placeholder image
+        "attributes": [
+            {"trait_type": "Event ID", "value": event.id},
+            {"trait_type": "Location", "value": event.location},
+            {"trait_type": "Date", "value": event.date.isoformat()},
+            {"trait_type": "Price", "value": event.price},
+            {"trait_type": "Category", "value": event.category},
+            {"trait_type": "Owner Wallet", "value": ticket.owner_wallet_address},
+        ],
+    }
+    return metadata
+
 # Incluir routers en la app
 app.include_router(auth_router)
 app.include_router(events_router)
 app.include_router(web3_router)
+app.include_router(metadata_router)
 
 @app.get("/")
 def read_root():
