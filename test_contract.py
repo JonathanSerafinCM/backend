@@ -1,77 +1,112 @@
 
+import pytest
 from web3 import Web3
 import json
 import os
 from dotenv import load_dotenv
 
-
 # Cargar variables de entorno
 load_dotenv(encoding='utf-8', override=True)
 
-# Conectar a Ganache (asegúrate de que Ganache esté corriendo)
-w3 = Web3(Web3.HTTPProvider('http://127.0.0.1:8545'))
+# --- Fixtures de Pytest ---
 
-if not w3.is_connected():
-    raise Exception("No se pudo conectar a Ganache. Asegúrate de que esté corriendo en http://127.0.0.1:8545")
+@pytest.fixture(scope="module")
+def w3():
+    """Fixture para inicializar la conexión a Ganache."""
+    _w3 = Web3(Web3.HTTPProvider('http://127.0.0.1:8545'))
+    if not _w3.is_connected():
+        pytest.fail("No se pudo conectar a Ganache. Asegúrate de que esté corriendo.")
+    return _w3
 
-print("Conectado a Ganache.")
+@pytest.fixture(scope="module")
+def deployer_account(w3):
+    """Fixture para obtener la cuenta de despliegue desde la clave privada."""
+    private_key = os.getenv("PRIVATE_KEY")
+    if not private_key:
+        pytest.fail("La variable de entorno PRIVATE_KEY no está configurada.")
+    return w3.eth.account.from_key(private_key)
 
-# Cargar ABI y Bytecode del contrato TicketManager
-try:
-    with open("TicketManager.abi", "r") as f:
-        abi = json.load(f)
-    with open("TicketManager.bin", "r") as f:
-        bytecode = f.read()
-except FileNotFoundError:
-    print("ABI o Bytecode no encontrados. Asegúrate de haber compilado el contrato con compile_contract.py")
-    exit()
+@pytest.fixture(scope="module")
+def compiled_contract():
+    """Fixture para cargar el ABI y el bytecode del contrato."""
+    try:
+        with open("TicketManager.abi", "r") as f:
+            abi = json.load(f)
+        with open("TicketManager.bin", "r") as f:
+            bytecode = f.read()
+    except FileNotFoundError:
+        pytest.fail("ABI o Bytecode no encontrados. Compila el contrato primero.")
+    return {"abi": abi, "bytecode": bytecode}
 
+@pytest.fixture(scope="module")
+def deployed_contract(w3, deployer_account, compiled_contract):
+    """Fixture para desplegar el contrato TicketManager."""
+    TicketManager = w3.eth.contract(
+        abi=compiled_contract['abi'],
+        bytecode=compiled_contract['bytecode']
+    )
+    
+    # Estimar gas antes de construir la transacción
+    constructor_tx = TicketManager.constructor().build_transaction({
+        'from': deployer_account.address,
+        'nonce': w3.eth.get_transaction_count(deployer_account.address),
+        'gasPrice': w3.eth.gas_price,
+    })
+    
+    # Estimar el gas necesario y añadir un margen
+    estimated_gas = w3.eth.estimate_gas(constructor_tx)
+    constructor_tx['gas'] = estimated_gas + 50000
 
-# Obtener la clave privada y derivar la dirección pública
-PRIVATE_KEY = os.getenv("PRIVATE_KEY")
-deployer_account = w3.eth.account.from_key(PRIVATE_KEY).address
-print(f"Usando la cuenta de despliegue: {deployer_account}")
+    signed_txn = w3.eth.account.sign_transaction(constructor_tx, private_key=deployer_account.key)
+    tx_hash = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
+    tx_receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+    
+    contract_instance = w3.eth.contract(
+        address=tx_receipt.contractAddress,
+        abi=compiled_contract['abi']
+    )
+    return contract_instance
 
-# Crear el objeto contrato
-TicketManager = w3.eth.contract(abi=abi, bytecode=bytecode)
+# --- Tests del Contrato ---
 
-# Construir la transacción de despliegue
-# Si tu constructor de TicketManager.sol requiere argumentos, pásalos aquí:
-# Por ejemplo: constructor_args = [arg1, arg2]
-# transaction = TicketManager.constructor(*constructor_args).build_transaction({
-transaction = TicketManager.constructor().build_transaction({
-    'from': deployer_account,
-    'nonce': w3.eth.get_transaction_count(deployer_account),
-    'gasPrice': w3.eth.gas_price
-})
+def test_contract_deployment(deployed_contract):
+    """Verifica que el contrato se haya desplegado correctamente."""
+    assert deployed_contract.address is not None
+    assert len(deployed_contract.address) == 42
 
+def test_safe_mint(w3, deployed_contract, deployer_account):
+    """Prueba la función safeMint para crear un nuevo ticket."""
+    # Parámetros para el nuevo ticket
+    recipient_address = w3.eth.accounts[1]  # Usar otra cuenta de Ganache como destinatario
+    token_id = 1
+    token_uri = f"https://api.ticketera.com/metadata/tickets/{token_id}"
 
-# Firmar la transacción
-signed_txn = w3.eth.account.sign_transaction(transaction, private_key=PRIVATE_KEY)
+    # Construir la transacción para llamar a safeMint
+    mint_tx = deployed_contract.functions.safeMint(
+        recipient_address,
+        token_uri
+    ).build_transaction({
+        'from': deployer_account.address,
+        'nonce': w3.eth.get_transaction_count(deployer_account.address),
+        'gasPrice': w3.eth.gas_price,
+    })
 
-# Enviar la transacción
-tx_hash = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
-print(f"Transacción de despliegue enviada. Hash: {tx_hash.hex()}")
+    mint_tx['gas'] = 500000
 
-# Esperar a que la transacción sea minada y obtener el recibo
-tx_receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
-contract_address = tx_receipt.contractAddress
-print(f"Contrato desplegado en la dirección: {contract_address}")
+    # Firmar y enviar la transacción
+    signed_mint_tx = w3.eth.account.sign_transaction(mint_tx, private_key=deployer_account.key)
+    tx_hash = w3.eth.send_raw_transaction(signed_mint_tx.raw_transaction)
+    tx_receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
 
-# Guardar la dirección del contrato para usarla en main.py o en tests futuros
-# Puedes guardar esto en un archivo .env o directamente en una variable de entorno
-# Por ahora, lo imprimimos y puedes copiarlo
-print(f"Por favor, guarda esta dirección del contrato en tu .env como CONTRACT_ADDRESS: {contract_address}")
+    # Procesar el evento Transfer para obtener el tokenId
+    transfer_event = deployed_contract.events.Transfer().process_receipt(tx_receipt)
+    assert len(transfer_event) == 1, "Debería haberse emitido un solo evento Transfer"
+    token_id = transfer_event[0]['args']['tokenId']
 
-# Interactuar con el contrato (ejemplo: llamar a una función)
-# Asegúrate de que tu contrato TicketManager.sol tenga una función `name()` o `symbol()` si es ERC721
-# contract_instance = w3.eth.contract(address=contract_address, abi=abi)
-# try:
-#     contract_name = contract_instance.functions.name().call()
-#     contract_symbol = contract_instance.functions.symbol().call()
-#     print(f"Nombre del contrato: {contract_name}")
-#     print(f"Símbolo del contrato: {contract_symbol}")
-# except Exception as e:
-#     print(f"Error al llamar a funciones del contrato (¿ERC721?): {e}")
+    # Verificar que el dueño del nuevo token es el destinatario
+    owner = deployed_contract.functions.ownerOf(token_id).call()
+    assert owner == recipient_address
 
-print("\nDespliegue y prueba básica completados.")
+    # Verificar que el tokenURI se haya establecido correctamente
+    uri = deployed_contract.functions.tokenURI(token_id).call()
+    assert uri == token_uri

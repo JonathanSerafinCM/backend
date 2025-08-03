@@ -320,14 +320,15 @@ def purchase_ticket(
     contract = w3.eth.contract(address=contract_address, abi=abi)
     nonce = w3.eth.get_transaction_count(ACCOUNT_ADDRESS)
     
+    # Generar un ID de ticket único
     token_uri = f"https://api.ticketera.com/metadata/tickets/{event.id}"
+
     mint_function = contract.functions.safeMint(current_user.wallet_address, token_uri)
     
-    gas_estimate = mint_function.estimate_gas({'from': ACCOUNT_ADDRESS, 'nonce': nonce})
     tx_data = mint_function.build_transaction({
         'from': ACCOUNT_ADDRESS,
         'chainId': 1337,
-        'gas': gas_estimate,
+        'gas': 500000,  # Usar un valor de gas fijo y suficientemente alto
         'gasPrice': w3.to_wei(20, 'gwei'),
         'nonce': nonce,
     })

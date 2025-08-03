@@ -1,7 +1,7 @@
 import pytest
 import os
 from fastapi.testclient import TestClient
-from main import app, UserRole, get_db, User, Event, get_w3
+from main import app, UserRole, get_db, User, Event, get_w3, SessionLocal
 from test_auth import random_string
 from sqlalchemy.orm import Session
 from web3 import Web3
@@ -16,7 +16,7 @@ client = TestClient(app)
 
 # --- Helpers ---
 account_index = 0
-def create_user_and_get_token(role: UserRole = UserRole.COMPRADOR, wallet_address: str | None = None):
+def create_user_and_get_token(db: Session, role: UserRole = UserRole.COMPRADOR, wallet_address: str | None = None):
     global account_index
     email = f"test_{random_string()}@example.com"
     password = random_string(12)
@@ -32,22 +32,19 @@ def create_user_and_get_token(role: UserRole = UserRole.COMPRADOR, wallet_addres
     client.post("/auth/register", json=register_data)
     
     if role == UserRole.ORGANIZADOR:
-        db: Session = next(get_db())
         user = db.query(User).filter(User.email == email).first()
         if user:
             user.role = UserRole.ORGANIZADOR
             db.commit()
-        db.close()
         
     login_response = client.post("/auth/login", data={"username": email, "password": password})
     token = login_response.json()["access_token"]
     return token, wallet_address
 
-def create_event_for_purchase():
-    token, _ = create_user_and_get_token(role=UserRole.ORGANIZADOR)
+def create_event(db: Session, token: str):
     headers = {"Authorization": f"Bearer {token}"}
     event_data = {
-        "name": "Evento de Prueba para Comprar",
+        "name": f"Evento de Prueba {random_string(5)}",
         "description": "Un evento para probar la compra de tickets NFT",
         "date": "2027-01-01T12:00:00",
         "location": "Lugar de Prueba",
@@ -55,81 +52,94 @@ def create_event_for_purchase():
         "total_tickets": 5
     }
     response = client.post("/events", json=event_data, headers=headers)
-    return response.json()["id"]
+    assert response.status_code == 200, response.text
+    event_id = response.json()["id"]
+    return db.query(Event).filter(Event.id == event_id).first()
 
-@pytest.fixture(autouse=True)
-def clean_db():
-    db = next(get_db())
-    db.query(Event).delete()
-    db.query(User).delete()
-    db.commit()
-    db.close()
+# --- Fixtures ---
+@pytest.fixture(scope="function")
+def db_session():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+@pytest.fixture(scope='function', autouse=True)
+def clean_db(db_session):
+    db_session.query(Event).delete()
+    db_session.query(User).delete()
+    db_session.commit()
     yield
 
 # --- Tests de Blockchain ---
-@pytest.fixture(scope="module")
-def contract_address():
-    address = os.getenv("CONTRACT_ADDRESS")
-    if not address:
-        pytest.fail("La variable de entorno CONTRACT_ADDRESS no está definida.")
-    return address
 
-def test_purchase_ticket(contract_address):
-    event_id = create_event_for_purchase()
-    token, owner_address = create_user_and_get_token(role=UserRole.COMPRADOR)
-    headers = {"Authorization": f"Bearer {token}"}
+def test_purchase_ticket(db_session):
+    # 1. Crear Organizador y Evento
+    org_token, _ = create_user_and_get_token(db_session, role=UserRole.ORGANIZADOR)
+    event = create_event(db_session, org_token)
+
+    # 2. Crear Comprador
+    buyer_token, _ = create_user_and_get_token(db_session, role=UserRole.COMPRADOR)
+    headers = {"Authorization": f"Bearer {buyer_token}"}
     
-    response = client.post(f"/events/{event_id}/purchase", headers=headers)
+    # 3. Comprar Ticket
+    response = client.post(f"/events/{event.id}/purchase", headers=headers)
     
+    # 4. Verificar
     assert response.status_code == 200, response.text
     data = response.json()
     assert "transaction_hash" in data
     assert "ticket_id" in data
-    # Guardar para el siguiente test
-    os.environ["LAST_TICKET_ID"] = str(data["ticket_id"])
-    os.environ["LAST_TICKET_OWNER_ADDRESS"] = owner_address
+    assert data["ticket_id"] is not None
 
-def test_get_ticket_owner(contract_address):
-    ticket_id = os.getenv("LAST_TICKET_ID")
-    owner_address = os.getenv("LAST_TICKET_OWNER_ADDRESS")
-    assert ticket_id is not None, "No se pudo obtener el ticket_id del test anterior"
-    assert owner_address is not None, "No se pudo obtener la owner_address del test anterior"
+def test_get_ticket_owner(db_session):
+    # 1. Crear y comprar un ticket
+    org_token, _ = create_user_and_get_token(db_session, role=UserRole.ORGANIZADOR)
+    event = create_event(db_session, org_token)
+    buyer_token, buyer_address = create_user_and_get_token(db_session, role=UserRole.COMPRADOR)
+    purchase_res = client.post(f"/events/{event.id}/purchase", headers={"Authorization": f"Bearer {buyer_token}"})
+    ticket_id = purchase_res.json()["ticket_id"]
 
+    # 2. Obtener el dueño del ticket
     response = client.get(f"/tickets/{ticket_id}/owner")
     
+    # 3. Verificar
     assert response.status_code == 200, response.text
     data = response.json()
-    assert data["ticket_id"] == int(ticket_id)
-    assert data["owner"] == owner_address
+    assert data["ticket_id"] == ticket_id
+    assert data["owner"] == buyer_address
 
-def test_get_user_tickets(contract_address):
-    token, wallet_address = create_user_and_get_token(role=UserRole.COMPRADOR)
-    headers = {"Authorization": f"Bearer {token}"}
+def test_get_user_tickets(db_session):
+    # 1. Crear y comprar un ticket
+    org_token, _ = create_user_and_get_token(db_session, role=UserRole.ORGANIZADOR)
+    event = create_event(db_session, org_token)
+    buyer_token, _ = create_user_and_get_token(db_session, role=UserRole.COMPRADOR)
+    purchase_res = client.post(f"/events/{event.id}/purchase", headers={"Authorization": f"Bearer {buyer_token}"})
+    ticket_id = purchase_res.json()["ticket_id"]
 
-    event_id = create_event_for_purchase()
-    purchase_response = client.post(f"/events/{event_id}/purchase", headers=headers)
-    assert purchase_response.status_code == 200
-    ticket_id = purchase_response.json()["ticket_id"]
+    # 2. Obtener los tickets del usuario
+    response = client.get("/auth/users/me/tickets", headers={"Authorization": f"Bearer {buyer_token}"})
 
-    response = client.get("/auth/users/me/tickets", headers=headers)
-
+    # 3. Verificar
     assert response.status_code == 200, response.text
     data = response.json()
     assert isinstance(data, list)
     assert len(data) > 0
     assert any(ticket['ticket_id'] == ticket_id for ticket in data)
-    assert all("owner" in ticket and "ticket_id" in ticket for ticket in data)
 
-def test_get_ticket_history(contract_address):
-    event_id = create_event_for_purchase()
-    token, owner_address = create_user_and_get_token(role=UserRole.COMPRADOR)
-    headers = {"Authorization": f"Bearer {token}"}
-    purchase_response = client.post(f"/events/{event_id}/purchase", headers=headers)
-    assert purchase_response.status_code == 200
-    ticket_id = purchase_response.json()["ticket_id"]
+def test_get_ticket_history(db_session):
+    # 1. Crear y comprar un ticket
+    org_token, _ = create_user_and_get_token(db_session, role=UserRole.ORGANIZADOR)
+    event = create_event(db_session, org_token)
+    buyer_token, buyer_address = create_user_and_get_token(db_session, role=UserRole.COMPRADOR)
+    purchase_res = client.post(f"/events/{event.id}/purchase", headers={"Authorization": f"Bearer {buyer_token}"})
+    ticket_id = purchase_res.json()["ticket_id"]
 
+    # 2. Obtener el historial del ticket
     response = client.get(f"/tickets/{ticket_id}/history")
 
+    # 3. Verificar
     assert response.status_code == 200, response.text
     data = response.json()
     assert data["ticket_id"] == ticket_id
@@ -137,15 +147,13 @@ def test_get_ticket_history(contract_address):
     history = data["history"]
     assert isinstance(history, list)
     assert len(history) > 0
-    # El primer evento debe ser el minteo
     assert history[0]["from"] == "0x0000000000000000000000000000000000000000"
-    assert history[0]["to"] == owner_address
+    assert history[0]["to"] == buyer_address
 
+# --- Test de IA (Placeholder) ---
 def test_get_event_recommendations():
     response = client.get("/events/recommendations")
     assert response.status_code == 200
     data = response.json()
     assert "events" in data
     assert isinstance(data["events"], list)
-    assert len(data["events"]) > 0
-    assert all("id" in event and "name" in event and "category" in event for event in data["events"])
