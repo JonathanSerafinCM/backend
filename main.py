@@ -354,9 +354,9 @@ def purchase_ticket(
     
     tx_data = mint_function.build_transaction({
         'from': ACCOUNT_ADDRESS,
-        'chainId': 1337,
+        'chainId': 80002,
         'gas': 500000,  # Usar un valor de gas fijo y suficientemente alto
-        'gasPrice': w3.to_wei(20, 'gwei'),
+        'gasPrice': w3.to_wei(50, 'gwei'),
         'nonce': nonce,
     })
 
