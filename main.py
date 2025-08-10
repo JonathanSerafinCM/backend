@@ -20,13 +20,12 @@ from web3 import Web3
 load_dotenv(encoding='utf-8', override=True)
 
 # --- Configuración de la Base de Datos (PostgreSQL) ---
-DB_USER = os.getenv("DB_USER", "postgres")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "1234")
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = os.getenv("DB_PORT", "5432")
-DB_NAME = os.getenv("DB_NAME", "ticketera")
+DATABASE_URL = os.getenv("DATABASE_URL") # Render inyectará esta variable
 
-DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+# Asegúrate de que DATABASE_URL no sea None en producción
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL environment variable not set.")
+
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
