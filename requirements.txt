@@ -64,7 +64,6 @@ python-dotenv==1.1.1
 python-jose==3.5.0
 python-multipart==0.0.20
 pyunormalize==16.0.0
-pywin32==311
 PyYAML==6.0.2
 regex==2025.7.34
 requests==2.32.4
