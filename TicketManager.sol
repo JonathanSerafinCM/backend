@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-import "./contracts/ERC721Enumerable.sol";
+import "./contracts/ERC721.sol";
 import "./contracts/access/Ownable.sol";
 import "./contracts/utils/Counters.sol";
 
-contract TicketManager is ERC721Enumerable, Ownable {
+contract TicketManager is ERC721, Ownable {
     using Counters for Counters.Counter;
     Counters.Counter private _ticketIds;
 

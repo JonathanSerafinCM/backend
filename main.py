@@ -393,7 +393,9 @@ def purchase_ticket(
 
 # --- Blockchain (Web3) ---
 def get_w3():
-    return Web3(Web3.HTTPProvider("http://127.0.0.1:8545"))
+    # Usa la URL del RPC de la testnet desde las variables de entorno, con fallback al nodo local
+    rpc_url = os.getenv("TESTNET_RPC_URL", "http://127.0.0.1:8545")
+    return Web3(Web3.HTTPProvider(rpc_url))
 
 with open("TicketManager.abi", "r") as f:
     abi = json.load(f)

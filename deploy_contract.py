@@ -8,13 +8,14 @@ from dotenv import load_dotenv
 # Cargar variables de entorno
 load_dotenv(encoding='utf-8', override=True)
 
-# Conectar a Ganache (asegúrate de que Ganache esté corriendo)
-w3 = Web3(Web3.HTTPProvider('http://127.0.0.1:8545'))
+# Conectar a la red (Testnet o Local)
+rpc_url = os.getenv("TESTNET_RPC_URL", "http://127.0.0.1:8545")
+w3 = Web3(Web3.HTTPProvider(rpc_url))
 
 if not w3.is_connected():
-    raise Exception("No se pudo conectar a Ganache. Asegúrate de que esté corriendo en http://127.0.0.1:8545")
+    raise Exception(f"No se pudo conectar a la red en {rpc_url}. Asegúrate de que la URL sea correcta y la red esté disponible.")
 
-print("Conectado a Ganache.")
+print(f"Conectado a la red: {rpc_url}")
 
 # Cargar ABI y Bytecode del contrato TicketManager
 try:
@@ -42,7 +43,8 @@ TicketManager = w3.eth.contract(abi=abi, bytecode=bytecode)
 transaction = TicketManager.constructor().build_transaction({
     'from': deployer_account,
     'nonce': w3.eth.get_transaction_count(deployer_account),
-    'gasPrice': w3.eth.gas_price
+    'gasPrice': w3.to_wei('30', 'gwei'), # Precio de gas ajustado a 30 Gwei para asegurar el minado
+    'gas': 2500000  # Límite de gas ajustado para asegurar el despliegue en Amoy
 })
 
 
@@ -54,7 +56,7 @@ tx_hash = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
 print(f"Transacción de despliegue enviada. Hash: {tx_hash.hex()}")
 
 # Esperar a que la transacción sea minada y obtener el recibo
-tx_receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+tx_receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=240) # Aumentamos el tiempo de espera a 240s
 contract_address = tx_receipt.contractAddress
 print(f"Contrato desplegado en la dirección: {contract_address}")
 
