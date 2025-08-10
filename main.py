@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
 from fastapi import Depends, FastAPI, HTTPException, APIRouter
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -170,6 +171,15 @@ app = FastAPI(
     title="Ticketera IA + Blockchain API",
     description="Backend para la gestión de eventos, tickets NFT y recomendaciones con IA.",
     version="0.1.0"
+)
+
+# --- CORS Middleware ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # En producción, deberías restringir esto a tu dominio de frontend
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # --- Routers ---
@@ -470,6 +480,25 @@ def get_sales_by_category(db: Session = Depends(get_db), current_user: User = De
     ).join(Ticket, Event.id == Ticket.event_id).group_by(Event.category).all()
 
     return [{"category": category, "tickets_sold": tickets_sold} for category, tickets_sold in sales_data]
+
+# --- Endpoint temporal para pruebas (NO USAR EN PRODUCCIÓN) ---
+@admin_router.post("/promote-to-organizer/{user_email}")
+def promote_to_organizer_temp(
+    user_email: str,
+    db: Session = Depends(get_db),
+    # No requerimos autenticación para este endpoint temporal
+):
+    # Buscar el usuario por email
+    user = db.query(User).filter(User.email == user_email).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Promover a organizador
+    user.role = UserRole.ORGANIZADOR
+    db.commit()
+    db.refresh(user)
+    
+    return {"message": f"User {user_email} promoted to organizer successfully", "user": user.email, "new_role": user.role}
 
 # Incluir routers en la app
 app.include_router(auth_router)
