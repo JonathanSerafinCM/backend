@@ -221,32 +221,21 @@ def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db:
 async def read_users_me(current_user: User = Depends(get_current_user)):
     return current_user
 
-@users_router.get("/me/tickets", tags=["Blockchain"])
+@users_router.get("/me/tickets", tags=["Blockchain"], response_model=list[dict])
 def get_my_tickets(
     current_user: User = Depends(get_current_user),
-    contract_address: str = Depends(lambda: get_contract_address()),
-    w3: Web3 = Depends(lambda: get_w3())
+    db: Session = Depends(get_db)
 ):
     if not current_user.wallet_address:
         raise HTTPException(status_code=400, detail="User does not have a wallet address registered.")
 
-    contract = w3.eth.contract(address=contract_address, abi=abi)
+    tickets_db = db.query(Ticket).filter(Ticket.owner_wallet_address == current_user.wallet_address).all()
     
-    try:
-        balance = contract.functions.balanceOf(current_user.wallet_address).call()
-        if balance == 0:
-            return []
-
-        tickets = []
-        for i in range(balance):
-            ticket_id = contract.functions.tokenOfOwnerByIndex(current_user.wallet_address, i).call()
-            owner = contract.functions.ownerOf(ticket_id).call()
-            tickets.append({"ticket_id": ticket_id, "owner": owner})
+    tickets_out = []
+    for ticket in tickets_db:
+        tickets_out.append({"ticket_id": ticket.ticket_id_onchain, "owner": ticket.owner_wallet_address})
             
-        return tickets
-    except Exception as e:
-        print(f"Error fetching tickets from blockchain: {e}")
-        raise HTTPException(status_code=500, detail="Could not fetch tickets from the blockchain.")
+    return tickets_out
 
 # --- Endpoints de Eventos ---
 @events_router.get("/recommendations", tags=["AI"], response_model=list[EventOut])
@@ -356,7 +345,7 @@ def purchase_ticket(
         'from': ACCOUNT_ADDRESS,
         'chainId': 80002,
         'gas': 500000,  # Usar un valor de gas fijo y suficientemente alto
-        'gasPrice': w3.to_wei(50, 'gwei'),
+        'gasPrice': w3.to_wei(30, 'gwei'),
         'nonce': nonce,
     })
 
