@@ -184,6 +184,7 @@ app.add_middleware(
 
 # --- Routers ---
 auth_router = APIRouter(prefix="/auth", tags=["Authentication"])
+users_router = APIRouter(prefix="/users", tags=["Users"]) # Router para usuarios
 events_router = APIRouter(prefix="/events", tags=["Events"])
 web3_router = APIRouter(prefix="/tickets", tags=["Blockchain"])
 metadata_router = APIRouter(prefix="/metadata", tags=["Metadata"])
@@ -220,7 +221,7 @@ def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db:
 async def read_users_me(current_user: User = Depends(get_current_user)):
     return current_user
 
-@auth_router.get("/users/me/tickets", tags=["Blockchain"])
+@users_router.get("/me/tickets", tags=["Blockchain"])
 def get_my_tickets(
     current_user: User = Depends(get_current_user),
     contract_address: str = Depends(lambda: get_contract_address()),
@@ -502,6 +503,7 @@ def promote_to_organizer_temp(
 
 # Incluir routers en la app
 app.include_router(auth_router)
+app.include_router(users_router)
 app.include_router(events_router)
 app.include_router(web3_router)
 app.include_router(metadata_router)
