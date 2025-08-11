@@ -12,7 +12,7 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel
 from sqlalchemy import (Column, create_engine, DateTime, Enum, Float,
-                        ForeignKey, Integer, String, func)
+                        ForeignKey, Integer, String, func, Boolean)
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker, Session
 from web3 import Web3
 
@@ -20,7 +20,13 @@ from web3 import Web3
 load_dotenv(encoding='utf-8', override=True)
 
 # --- Configuración de la Base de Datos (PostgreSQL) ---
-DATABASE_URL = os.getenv("DATABASE_URL") # Render inyectará esta variable
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "1234")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "ticketera")
+
+DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
 # Asegúrate de que DATABASE_URL no sea None en producción
 if not DATABASE_URL:
@@ -55,9 +61,15 @@ class Event(Base):
     price = Column(Float, nullable=False)
     total_tickets = Column(Integer, nullable=False)
     category = Column(String, nullable=True) # Nueva columna para la categoría
+    total_revenue = Column(Float, default=0.0) # To track revenue
+    is_funds_withdrawn = Column(Boolean, default=False) # To simulate fund withdrawal
     owner_id = Column(Integer, ForeignKey("users.id"))
     owner = relationship("User", back_populates="events")
     tickets = relationship("Ticket", back_populates="event") # Relación con tickets
+
+from datetime import datetime # Make sure this is at the top
+
+# ... existing code ...
 
 class Ticket(Base):
     __tablename__ = "tickets"
@@ -65,6 +77,8 @@ class Ticket(Base):
     ticket_id_onchain = Column(Integer, unique=True, index=True, nullable=False)
     event_id = Column(Integer, ForeignKey("events.id"))
     owner_wallet_address = Column(String, nullable=False)
+    purchase_date = Column(DateTime, default=datetime.utcnow)
+    is_paid = Column(Boolean, default=False) # To simulate payment status
     event = relationship("Event", back_populates="tickets")
 
 # Crear tablas en la base de datos
@@ -96,6 +110,8 @@ class EventCreate(BaseModel):
 class EventOut(EventCreate):
     id: int
     category: str | None = None
+    total_revenue: float | None = None
+    is_funds_withdrawn: bool | None = None
     class Config:
         from_attributes = True
 
@@ -293,6 +309,27 @@ def update_event(
     db.refresh(event)
     return event
 
+@events_router.post("/{event_id}/simulate-withdrawal")
+def simulate_withdraw_funds(
+    event_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    event = db.query(Event).filter(Event.id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    if event.owner_id != current_user.id or current_user.role != UserRole.ORGANIZADOR:
+        raise HTTPException(status_code=403, detail="Not authorized to withdraw funds for this event")
+    if event.is_funds_withdrawn:
+        raise HTTPException(status_code=400, detail="Funds already withdrawn for this event")
+
+    # Simulate fund withdrawal
+    event.is_funds_withdrawn = True
+    db.commit()
+    
+    return {"message": f"Funds for event '{event.name}' marked as withdrawn (simulated).", "amount": event.total_revenue}
+
+
 @events_router.delete("/{event_id}")
 def delete_event(
     event_id: int, 
@@ -353,6 +390,8 @@ def purchase_ticket(
     tx_receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
 
     event.total_tickets -= 1
+    # Simulate payment by tracking revenue
+    event.total_revenue += event.price
     db.commit()
 
     transfer_events = contract.events.Transfer.process_receipt(tx_receipt)
@@ -363,11 +402,13 @@ def purchase_ticket(
 
     ticket_id = mint_event['args']['tokenId']
 
-    # Guardar el ticket en la base de datos
+    # Guardar el ticket en la base de datos with simulated payment
     new_ticket_db = Ticket(
         ticket_id_onchain=ticket_id,
         event_id=event.id,
-        owner_wallet_address=current_user.wallet_address
+        owner_wallet_address=current_user.wallet_address,
+        is_paid=True, # Simulate payment
+        purchase_date=datetime.utcnow()
     )
     db.add(new_ticket_db)
     db.commit()
@@ -376,7 +417,9 @@ def purchase_ticket(
     return {
         "message": "Ticket purchased and minted successfully", 
         "transaction_hash": tx_hash.hex(),
-        "ticket_id": ticket_id
+        "ticket_id": ticket_id,
+        "paid_amount": event.price,
+        "purchase_date": new_ticket_db.purchase_date.isoformat()
     }
 
 # --- Blockchain (Web3) ---
