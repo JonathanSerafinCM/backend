@@ -12,9 +12,10 @@ This document explains how to run the Ticketera backend alongside PostgreSQL usi
 1. Duplicate the provided `.env.example` file and rename the copy to `.env`.
 2. Update the placeholders:
 
-  - `POSTGRES_*` values define the credentials for the bundled PostgreSQL instance.
-  - `SECRET_KEY` secures JWT generation.
-  - `TESTNET_RPC_URL`, `CONTRACT_ADDRESS`, and `PRIVATE_KEY` must point to a working RPC endpoint, contract address, and wallet private key that has funds on the target network.
+    - `POSTGRES_*` values define the credentials for the bundled PostgreSQL instance.
+    - `SECRET_KEY` secures JWT generation.
+    - `TESTNET_RPC_URL`, `CONTRACT_ADDRESS`, and `PRIVATE_KEY` must point to a working RPC endpoint, contract address, and wallet private key that has funds on the target network.
+    - `BACKEND_HOST_PORT` lets you expose the API on a different host port if `8000` is already taken (for example, set it to `8080`).
 
 ## 3. Build and run
 
