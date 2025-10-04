@@ -184,9 +184,15 @@ app = FastAPI(
 )
 
 # --- CORS Middleware ---
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "")
+allowed_origins = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
+if not allowed_origins:
+    # fallback seguro en prod: front público
+    allowed_origins = ["https://coffetimeevents.areadev.es"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # En producción, deberías restringir esto a tu dominio de frontend
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -536,6 +542,10 @@ app.include_router(events_router)
 app.include_router(web3_router)
 app.include_router(metadata_router)
 app.include_router(admin_router)
+
+@app.get("/health", include_in_schema=False)
+def health():
+    return {"status": "ok"}
 
 @app.get("/")
 def read_root():

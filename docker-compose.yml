@@ -8,8 +8,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5433:5432"
+    # No publicar puertos hacia el host en producción
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 10s
@@ -28,12 +27,26 @@ services:
     env_file:
       - .env
     environment:
+      # Compose construye DATABASE_URL para el contenedor
       DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+    # Publicar SOLO en loopback del host. Nginx de Plesk hará reverse proxy.
     ports:
-      - "${BACKEND_HOST_PORT:-8000}:8000"
-    volumes:
-      - ./:/app
-    command: uvicorn main:app --host 0.0.0.0 --port 8000
+      - "127.0.0.1:8000:8000"
+    # En prod no montamos el código como volumen
+    # volumes:
+    #   - ./:/app
+    command: >
+      uvicorn main:app
+      --host 0.0.0.0
+      --port 8000
+      --workers 2
+      --proxy-headers
+      --forwarded-allow-ips='*'
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
 volumes:
