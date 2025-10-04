@@ -1,0 +1,24 @@
+# Docker ignore
+
+__pycache__/
+*.py[cod]
+*$py.class
+.build/
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+ENV/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+*.swp
+node_modules/
+.cache/
