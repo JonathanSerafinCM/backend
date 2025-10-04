@@ -31,7 +31,7 @@ services:
       DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
     # Publicar SOLO en loopback del host. Nginx de Plesk hará reverse proxy.
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:8010:8000"
     # En prod no montamos el código como volumen
     # volumes:
     #   - ./:/app
