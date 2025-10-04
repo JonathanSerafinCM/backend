@@ -183,6 +183,10 @@ app = FastAPI(
     version="0.1.0"
 )
 
+@app.get("/health", include_in_schema=False)
+def health():
+    return {"status": "ok"}
+
 # --- CORS Middleware ---
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "")
 allowed_origins = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
@@ -542,10 +546,6 @@ app.include_router(events_router)
 app.include_router(web3_router)
 app.include_router(metadata_router)
 app.include_router(admin_router)
-
-@app.get("/health", include_in_schema=False)
-def health():
-    return {"status": "ok"}
 
 @app.get("/")
 def read_root():
