@@ -84,6 +84,7 @@ class UserCreate(BaseModel):
     email: str
     password: str
     wallet_address: str | None = None
+    role: UserRole | None = None
 
 class UserOut(BaseModel):
     id: int
@@ -218,10 +219,10 @@ def register_user(user: UserCreate, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Email already registered")
     hashed_password = get_password_hash(user.password)
     new_user = User(
-        email=user.email, 
-        hashed_password=hashed_password, 
-        wallet_address=user.wallet_address, 
-        role=UserRole.COMPRADOR
+        email=user.email,
+        hashed_password=hashed_password,
+        wallet_address=user.wallet_address,
+        role=user.role or UserRole.COMPRADOR
     )
     db.add(new_user)
     db.commit()
