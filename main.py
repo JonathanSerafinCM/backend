@@ -621,6 +621,134 @@ def get_event_purchases(
         "purchases": purchases
     }
 
+# --- Endpoint para obtener estadísticas del organizador ---
+@admin_router.get("/analytics/organizer-stats", tags=["Analytics"])
+def get_organizer_stats(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != UserRole.ORGANIZADOR:
+        raise HTTPException(status_code=403, detail="Only organizers can access this endpoint")
+    
+    # Obtener todos los eventos del organizador
+    organizer_events = db.query(Event).filter(Event.owner_id == current_user.id).all()
+    event_ids = [event.id for event in organizer_events]
+    
+    # Estadísticas generales
+    total_events = len(organizer_events)
+    total_revenue = sum(event.total_revenue or 0 for event in organizer_events)
+    
+    # Tickets vendidos totales y de esta semana
+    from datetime import datetime, timedelta
+    one_week_ago = datetime.utcnow() - timedelta(days=7)
+    
+    all_tickets = db.query(Ticket).filter(Ticket.event_id.in_(event_ids)).all()
+    total_tickets_sold = len(all_tickets)
+    
+    tickets_this_week = db.query(Ticket).filter(
+        Ticket.event_id.in_(event_ids),
+        Ticket.purchase_date >= one_week_ago
+    ).count()
+    
+    # Comparación con mes anterior para ingresos
+    thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+    sixty_days_ago = datetime.utcnow() - timedelta(days=60)
+    
+    tickets_last_30_days = db.query(Ticket).filter(
+        Ticket.event_id.in_(event_ids),
+        Ticket.purchase_date >= thirty_days_ago
+    ).all()
+    
+    tickets_previous_30_days = db.query(Ticket).filter(
+        Ticket.event_id.in_(event_ids),
+        Ticket.purchase_date >= sixty_days_ago,
+        Ticket.purchase_date < thirty_days_ago
+    ).all()
+    
+    revenue_last_30_days = sum(
+        db.query(Event).filter(Event.id == ticket.event_id).first().price 
+        for ticket in tickets_last_30_days
+    )
+    
+    revenue_previous_30_days = sum(
+        db.query(Event).filter(Event.id == ticket.event_id).first().price 
+        for ticket in tickets_previous_30_days
+    )
+    
+    # Calcular porcentaje de cambio en ingresos
+    if revenue_previous_30_days > 0:
+        revenue_change_percentage = ((revenue_last_30_days - revenue_previous_30_days) / revenue_previous_30_days) * 100
+    else:
+        revenue_change_percentage = 100 if revenue_last_30_days > 0 else 0
+    
+    # Eventos que finalizan pronto (próximos 7 días)
+    next_week = datetime.utcnow() + timedelta(days=7)
+    events_ending_soon = db.query(Event).filter(
+        Event.owner_id == current_user.id,
+        Event.date >= datetime.utcnow(),
+        Event.date <= next_week
+    ).count()
+    
+    # Actividad reciente (últimas 10 ventas)
+    recent_tickets = db.query(Ticket).filter(
+        Ticket.event_id.in_(event_ids)
+    ).order_by(Ticket.purchase_date.desc()).limit(10).all()
+    
+    recent_activity = []
+    for ticket in recent_tickets:
+        event = db.query(Event).filter(Event.id == ticket.event_id).first()
+        if event:
+            # Calcular tiempo transcurrido
+            time_diff = datetime.utcnow() - ticket.purchase_date
+            
+            if time_diff.total_seconds() < 3600:  # Menos de 1 hora
+                minutes = int(time_diff.total_seconds() / 60)
+                time_ago = f"Hace {minutes} min" if minutes > 0 else "Hace un momento"
+            elif time_diff.total_seconds() < 86400:  # Menos de 1 día
+                hours = int(time_diff.total_seconds() / 3600)
+                time_ago = f"Hace {hours} hora{'s' if hours > 1 else ''}"
+            else:
+                days = int(time_diff.total_seconds() / 86400)
+                time_ago = f"Hace {days} día{'s' if days > 1 else ''}"
+            
+            recent_activity.append({
+                "type": "sale",
+                "title": "Nueva venta confirmada",
+                "event_name": event.name,
+                "time_ago": time_ago,
+                "timestamp": ticket.purchase_date.isoformat()
+            })
+    
+    # Agregar eventos recientes (creados o actualizados)
+    recent_events = db.query(Event).filter(
+        Event.owner_id == current_user.id
+    ).order_by(Event.id.desc()).limit(5).all()
+    
+    for event in recent_events:
+        # Solo agregar si es reciente (últimas 24 horas)
+        # Como no tenemos campo de actualización, usamos la fecha del evento como referencia
+        recent_activity.append({
+            "type": "event",
+            "title": "Evento disponible",
+            "event_name": event.name,
+            "time_ago": "Recientemente",
+            "timestamp": datetime.utcnow().isoformat()
+        })
+    
+    # Ordenar por timestamp y limitar a 5
+    recent_activity.sort(key=lambda x: x["timestamp"], reverse=True)
+    recent_activity = recent_activity[:5]
+    
+    return {
+        "total_events": total_events,
+        "total_revenue": total_revenue,
+        "total_tickets_sold": total_tickets_sold,
+        "tickets_this_week": tickets_this_week,
+        "revenue_change_percentage": round(revenue_change_percentage, 1),
+        "events_ending_soon": events_ending_soon,
+        "recent_activity": recent_activity
+    }
+
 # --- Endpoint temporal para pruebas (NO USAR EN PRODUCCIÓN) ---
 @admin_router.post("/promote-to-organizer/{user_email}")
 def promote_to_organizer_temp(
