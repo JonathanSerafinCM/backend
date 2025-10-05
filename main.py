@@ -65,6 +65,9 @@ class Event(Base):
     owner_id = Column(Integer, ForeignKey("users.id"))
     owner = relationship("User", back_populates="events")
     tickets = relationship("Ticket", back_populates="event") # Relación con tickets
+    @property
+    def contract_address(self):
+        return os.getenv("CONTRACT_ADDRESS")
 
 from datetime import datetime # Make sure this is at the top
 
@@ -117,6 +120,7 @@ class EventOut(EventCreate):
     id: int
     category: str | None = None
     image_url: str | None = None
+    contract_address: str | None = None
     total_revenue: float | None = None
     is_funds_withdrawn: bool | None = None
     class Config:
@@ -131,6 +135,7 @@ class EventUpdate(BaseModel):
     total_tickets: int | None = None
     category: str | None = None
     image_url: str | None = None
+    contract_address: str | None = None
 
 class Token(BaseModel):
     access_token: str
