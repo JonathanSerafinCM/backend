@@ -2,11 +2,14 @@ import os
 import enum
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import uuid
 
 from dotenv import load_dotenv
 
-from fastapi import Depends, FastAPI, HTTPException, APIRouter
+from fastapi import Depends, FastAPI, HTTPException, APIRouter, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -56,6 +59,7 @@ class Event(Base):
     price = Column(Float, nullable=False)
     total_tickets = Column(Integer, nullable=False)
     category = Column(String, nullable=True) # Nueva columna para la categoría
+    image_url = Column(String, nullable=True)
     total_revenue = Column(Float, default=0.0) # To track revenue
     is_funds_withdrawn = Column(Boolean, default=False) # To simulate fund withdrawal
     owner_id = Column(Integer, ForeignKey("users.id"))
@@ -78,6 +82,11 @@ class Ticket(Base):
 
 # Crear tablas en la base de datos
 Base.metadata.create_all(bind=engine)
+
+# Directory for storing event images
+STATIC_UPLOAD_DIR = Path('static/event_images')
+STATIC_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
 
 # --- Schemas (Pydantic) ---
 class UserCreate(BaseModel):
@@ -102,10 +111,12 @@ class EventCreate(BaseModel):
     price: float
     total_tickets: int
     category: str | None = None
+    image_url: str | None = None
 
 class EventOut(EventCreate):
     id: int
     category: str | None = None
+    image_url: str | None = None
     total_revenue: float | None = None
     is_funds_withdrawn: bool | None = None
     class Config:
@@ -119,6 +130,7 @@ class EventUpdate(BaseModel):
     price: float | None = None
     total_tickets: int | None = None
     category: str | None = None
+    image_url: str | None = None
 
 class Token(BaseModel):
     access_token: str
@@ -203,6 +215,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
 # --- Routers ---
 auth_router = APIRouter(prefix="/auth", tags=["Authentication"])
 users_router = APIRouter(prefix="/users", tags=["Users"]) # Router para usuarios
@@ -271,10 +285,49 @@ def get_event_recommendations(event_id: int | None = None, db: Session = Depends
     return recommendations
 
 @events_router.post("", response_model=EventOut)
-def create_event(event: EventCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+async def create_event(
+    name: str = Form(...),
+    description: str | None = Form(None),
+    date: str = Form(...),
+    location: str = Form(...),
+    price: float = Form(...),
+    total_tickets: int = Form(...),
+    category: str | None = Form(None),
+    image: UploadFile | None = File(None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
     if current_user.role != UserRole.ORGANIZADOR:
         raise HTTPException(status_code=403, detail="Only organizers can create events")
-    new_event = Event(**event.model_dump(), owner=current_user)
+
+    try:
+        event_date = datetime.fromisoformat(date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use ISO 8601 format.")
+
+    image_url = None
+    if image:
+        allowed_types = {"image/jpeg", "image/png", "image/webp"}
+        if image.content_type not in allowed_types:
+            raise HTTPException(status_code=400, detail="Unsupported image type. Use JPEG, PNG, or WEBP.")
+        extension = Path(image.filename or '').suffix.lower() or '.jpg'
+        file_name = f"{uuid.uuid4()}" + extension
+        file_path = STATIC_UPLOAD_DIR / file_name
+        contents = await image.read()
+        file_path.write_bytes(contents)
+        image_url = f"/static/event_images/{file_name}"
+
+    new_event = Event(
+        name=name,
+        description=description,
+        date=event_date,
+        location=location,
+        price=price,
+        total_tickets=total_tickets,
+        category=category,
+        image_url=image_url,
+        owner=current_user
+    )
     db.add(new_event)
     db.commit()
     db.refresh(new_event)
