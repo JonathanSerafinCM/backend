@@ -579,6 +579,48 @@ def get_sales_by_category(db: Session = Depends(get_db), current_user: User = De
 
     return [{"category": category, "tickets_sold": tickets_sold} for category, tickets_sold in sales_data]
 
+# --- Endpoint para obtener tickets vendidos de un evento específico ---
+@events_router.get("/{event_id}/purchases", tags=["Analytics"])
+def get_event_purchases(
+    event_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    # Verificar que el evento existe
+    event = db.query(Event).filter(Event.id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    
+    # Verificar que el usuario actual es el organizador del evento
+    if current_user.role != UserRole.ORGANIZADOR or event.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="You are not authorized to view purchases for this event")
+    
+    # Obtener todos los tickets vendidos para este evento con información del comprador
+    tickets = db.query(Ticket).filter(Ticket.event_id == event_id).all()
+    
+    purchases = []
+    for ticket in tickets:
+        # Obtener información del comprador
+        buyer = db.query(User).filter(User.wallet_address == ticket.owner_wallet_address).first()
+        
+        purchases.append({
+            "ticket_id": ticket.ticket_id_onchain,
+            "ticket_db_id": ticket.id,
+            "buyer_email": buyer.email if buyer else "Desconocido",
+            "buyer_wallet": ticket.owner_wallet_address,
+            "purchase_date": ticket.purchase_date.isoformat() if ticket.purchase_date else None,
+            "is_paid": ticket.is_paid,
+            "price_paid": event.price
+        })
+    
+    return {
+        "event_id": event_id,
+        "event_name": event.name,
+        "total_purchases": len(purchases),
+        "total_revenue": event.total_revenue,
+        "purchases": purchases
+    }
+
 # --- Endpoint temporal para pruebas (NO USAR EN PRODUCCIÓN) ---
 @admin_router.post("/promote-to-organizer/{user_email}")
 def promote_to_organizer_temp(
