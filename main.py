@@ -125,6 +125,49 @@ Index(
 )
 
 
+class ListingStatus(str, enum.Enum):
+    ACTIVE = "active"
+    SOLD = "sold"
+    CANCELLED = "cancelled"
+    EXPIRED = "expired"
+
+
+class ResaleListing(Base):
+    """
+    Tabla para listados de reventa de tickets
+    """
+    __tablename__ = "resale_listings"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    event_id = Column(Integer, ForeignKey("events.id"), nullable=False, index=True)
+    token_id = Column(Integer, nullable=False, index=True)
+    seller_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    price_wei = Column(String, nullable=False)  # Almacenar como string para evitar overflow
+    status = Column(Enum(ListingStatus), default=ListingStatus.ACTIVE, nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = Column(DateTime, nullable=True)
+    sold_at = Column(DateTime, nullable=True)
+    buyer_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    tx_hash = Column(String, nullable=True)
+    
+    # Relaciones
+    event = relationship("Event")
+    seller = relationship("User", foreign_keys=[seller_id])
+    buyer = relationship("User", foreign_keys=[buyer_id])
+
+
+Index(
+    "ix_resale_listings_token_status",
+    ResaleListing.token_id,
+    ResaleListing.status
+)
+Index(
+    "ix_resale_listings_event_status",
+    ResaleListing.event_id,
+    ResaleListing.status
+)
+
+
 # Crear tablas en la base de datos
 Base.metadata.create_all(bind=engine)
 
@@ -246,6 +289,42 @@ class TokenData(BaseModel):
 class InteractionCreate(BaseModel):
     interaction_type: str
 
+
+class ResaleListingCreate(BaseModel):
+    event_id: int
+    token_id: int
+    price_wei: str
+    expires_at: Optional[datetime] = None
+
+
+class ResaleListingOut(BaseModel):
+    id: int
+    event_id: int
+    token_id: int
+    seller_id: int
+    price_wei: str
+    status: str
+    created_at: datetime
+    expires_at: Optional[datetime] = None
+    sold_at: Optional[datetime] = None
+    buyer_id: Optional[int] = None
+    tx_hash: Optional[str] = None
+    
+    class Config:
+        from_attributes = True
+
+
+class ResalePurchaseRequest(BaseModel):
+    listing_id: int
+
+
+class ResalePurchaseResponse(BaseModel):
+    listing_id: int
+    token_id: int
+    tx_hash: Optional[str]
+    status: str
+
+
 # --- Seguridad y Hashing ---
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 SECRET_KEY = os.getenv("SECRET_KEY", "a_super_secret_key_that_should_be_in_env")
@@ -332,6 +411,7 @@ web3_router = APIRouter(prefix="/tickets", tags=["Blockchain"])
 metadata_router = APIRouter(prefix="/metadata", tags=["Metadata"])
 admin_router = APIRouter(prefix="/admin", tags=["Admin"])
 organizer_router = APIRouter(prefix="/organizer", tags=["Organizer Analytics"])
+resale_router = APIRouter(prefix="/resale", tags=["Resale"])
 
 # --- Endpoints de Autenticación ---
 @auth_router.post("/register", response_model=UserOut)
@@ -1705,6 +1785,209 @@ def promote_to_organizer_temp(
     
     return {"message": f"User {user_email} promoted to organizer successfully", "user": user.email, "new_role": user.role}
 
+
+# --- Endpoints de Reventa ---
+
+@resale_router.post("/listings", response_model=ResaleListingOut, status_code=201)
+def create_resale_listing(
+    listing: ResaleListingCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Crear un listado de reventa para un ticket que el usuario posee.
+    
+    Validaciones:
+    - El usuario debe ser dueño del token_id
+    - No debe existir un listado activo para ese token_id
+    """
+    # Validar que el evento existe
+    event = db.query(Event).filter(Event.id == listing.event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    
+    # Validar que el usuario es dueño del token_id (verificar en BD)
+    ticket = db.query(Ticket).filter(
+        Ticket.ticket_id_onchain == listing.token_id,
+        Ticket.event_id == listing.event_id
+    ).first()
+    
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    
+    # Verificar ownership - comparar wallet address
+    if ticket.owner_wallet_address.lower() != (current_user.wallet_address or "").lower():
+        raise HTTPException(
+            status_code=412,
+            detail="You are not the owner of this ticket"
+        )
+    
+    # Validar que no exista un listado activo para este token_id
+    existing_listing = db.query(ResaleListing).filter(
+        ResaleListing.token_id == listing.token_id,
+        ResaleListing.status == ListingStatus.ACTIVE
+    ).first()
+    
+    if existing_listing:
+        raise HTTPException(
+            status_code=409,
+            detail="An active listing already exists for this ticket"
+        )
+    
+    # Validar price_wei
+    try:
+        price_int = int(listing.price_wei)
+        if price_int <= 0:
+            raise ValueError()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid price_wei format")
+    
+    # Crear el listado
+    new_listing = ResaleListing(
+        event_id=listing.event_id,
+        token_id=listing.token_id,
+        seller_id=current_user.id,
+        price_wei=listing.price_wei,
+        status=ListingStatus.ACTIVE,
+        expires_at=listing.expires_at
+    )
+    
+    db.add(new_listing)
+    db.commit()
+    db.refresh(new_listing)
+    
+    return new_listing
+
+
+@resale_router.post("/purchase", response_model=ResalePurchaseResponse)
+def purchase_resale_listing(
+    purchase: ResalePurchaseRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Comprar un ticket listado en reventa.
+    
+    Validaciones:
+    - El listado debe estar activo
+    - El listado no debe estar expirado
+    - El vendedor debe seguir siendo dueño del token
+    - Se ejecuta la transferencia NFT (simulada o real)
+    """
+    # Buscar el listado
+    listing = db.query(ResaleListing).filter(
+        ResaleListing.id == purchase.listing_id
+    ).first()
+    
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    
+    # Validar que el listado esté activo
+    if listing.status != ListingStatus.ACTIVE:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Listing is not active (current status: {listing.status})"
+        )
+    
+    # Validar expiración
+    if listing.expires_at and datetime.utcnow() > listing.expires_at:
+        listing.status = ListingStatus.EXPIRED
+        db.commit()
+        raise HTTPException(status_code=409, detail="Listing has expired")
+    
+    # Validar que el vendedor sigue siendo dueño del token
+    ticket = db.query(Ticket).filter(
+        Ticket.ticket_id_onchain == listing.token_id,
+        Ticket.event_id == listing.event_id
+    ).first()
+    
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    
+    seller = db.query(User).filter(User.id == listing.seller_id).first()
+    if not seller:
+        raise HTTPException(status_code=404, detail="Seller not found")
+    
+    if ticket.owner_wallet_address.lower() != (seller.wallet_address or "").lower():
+        raise HTTPException(
+            status_code=412,
+            detail="Seller is no longer the owner of this ticket"
+        )
+    
+    # Validar que el comprador no sea el vendedor
+    if current_user.id == listing.seller_id:
+        raise HTTPException(status_code=400, detail="Cannot buy your own listing")
+    
+    # Validar que el comprador tenga wallet_address
+    if not current_user.wallet_address:
+        raise HTTPException(
+            status_code=400,
+            detail="Buyer must have a wallet address to purchase tickets"
+        )
+    
+    # Ejecutar transferencia NFT (simulada para MVP)
+    # En producción real, aquí se llamaría a Web3 para hacer safeTransferFrom
+    tx_hash = None
+    try:
+        # Simulación: actualizar el owner en la BD
+        ticket.owner_wallet_address = current_user.wallet_address
+        
+        # Si hay configuración Web3, intentar transferencia real (opcional)
+        contract_address = os.getenv("CONTRACT_ADDRESS")
+        if contract_address:
+            # Aquí iría la lógica de transferencia real con Web3
+            # Por ahora, generar un tx_hash simulado
+            tx_hash = f"0x{''.join([hex(ord(c))[2:] for c in str(uuid.uuid4())[:32]])}"
+        
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to transfer NFT: {str(e)}"
+        )
+    
+    # Marcar el listado como vendido
+    listing.status = ListingStatus.SOLD
+    listing.sold_at = datetime.utcnow()
+    listing.buyer_id = current_user.id
+    listing.tx_hash = tx_hash
+    
+    db.commit()
+    db.refresh(listing)
+    
+    return ResalePurchaseResponse(
+        listing_id=listing.id,
+        token_id=listing.token_id,
+        tx_hash=tx_hash,
+        status=listing.status.value
+    )
+
+
+@resale_router.get("/listings", response_model=list[ResaleListingOut])
+def get_resale_listings(
+    event_id: Optional[int] = Query(None, description="Filter by event ID"),
+    status: Optional[str] = Query("active", description="Filter by status"),
+    db: Session = Depends(get_db)
+):
+    """
+    Obtener listados de reventa (endpoint adicional útil para el frontend)
+    """
+    query = db.query(ResaleListing)
+    
+    if event_id:
+        query = query.filter(ResaleListing.event_id == event_id)
+    
+    if status:
+        try:
+            status_enum = ListingStatus(status)
+            query = query.filter(ResaleListing.status == status_enum)
+        except ValueError:
+            pass  # Ignorar status inválido
+    
+    listings = query.order_by(ResaleListing.created_at.desc()).all()
+    return listings
+
+
 # Incluir routers en la app
 app.include_router(auth_router)
 app.include_router(users_router)
@@ -1713,6 +1996,7 @@ app.include_router(web3_router)
 app.include_router(metadata_router)
 app.include_router(admin_router)
 app.include_router(organizer_router)
+app.include_router(resale_router)
 
 @app.get("/")
 def read_root():
