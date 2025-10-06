@@ -257,6 +257,64 @@ def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db:
     access_token = create_access_token(data={"sub": user.email}, expires_delta=access_token_expires)
     return {"access_token": access_token, "token_type": "bearer"}
 
+# --- Login con Web3 Wallet ---
+class Web3LoginRequest(BaseModel):
+    wallet_address: str
+    signature: str
+    message: str
+
+@auth_router.post("/login/web3", response_model=Token)
+def login_with_web3(login_data: Web3LoginRequest, db: Session = Depends(get_db)):
+    """
+    Autenticación usando firma de wallet Web3.
+    El usuario debe firmar un mensaje con su wallet privada.
+    """
+    from eth_account.messages import encode_defunct
+    from eth_account import Account
+    
+    try:
+        # Verificar la firma
+        message = encode_defunct(text=login_data.message)
+        recovered_address = Account.recover_message(message, signature=login_data.signature)
+        
+        # Comparar direcciones (case-insensitive)
+        if recovered_address.lower() != login_data.wallet_address.lower():
+            raise HTTPException(status_code=401, detail="Invalid signature")
+        
+        # Buscar o crear usuario con esta wallet
+        user = db.query(User).filter(User.wallet_address == login_data.wallet_address.lower()).first()
+        
+        if not user:
+            # Crear nuevo usuario con wallet
+            # Email temporal basado en wallet
+            temp_email = f"{login_data.wallet_address.lower()}@wallet.local"
+            
+            # Verificar si el email ya existe (no debería)
+            existing_user = db.query(User).filter(User.email == temp_email).first()
+            if existing_user:
+                user = existing_user
+            else:
+                # Crear usuario nuevo
+                user = User(
+                    email=temp_email,
+                    hashed_password=get_password_hash(str(uuid.uuid4())),  # Password random
+                    wallet_address=login_data.wallet_address.lower(),
+                    role=UserRole.COMPRADOR  # Por defecto comprador
+                )
+                db.add(user)
+                db.commit()
+                db.refresh(user)
+        
+        # Generar token
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(data={"sub": user.email}, expires_delta=access_token_expires)
+        
+        return {"access_token": access_token, "token_type": "bearer"}
+        
+    except Exception as e:
+        print(f"Error in Web3 login: {e}")
+        raise HTTPException(status_code=401, detail="Authentication failed")
+
 @auth_router.get("/users/me", response_model=UserOut)
 async def read_users_me(current_user: User = Depends(get_current_user)):
     return current_user
