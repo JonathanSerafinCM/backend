@@ -7,7 +7,7 @@ import uuid
 
 from dotenv import load_dotenv
 
-from fastapi import Depends, FastAPI, HTTPException, APIRouter, UploadFile, File, Form
+from fastapi import Depends, FastAPI, HTTPException, APIRouter, UploadFile, File, Form, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -82,6 +82,31 @@ class Ticket(Base):
     purchase_date = Column(DateTime, default=datetime.utcnow)
     is_paid = Column(Boolean, default=False) # To simulate payment status
     event = relationship("Event", back_populates="tickets")
+
+
+class InteractionType(str, enum.Enum):
+    VIEW = "view"
+    CLICK = "click"
+    PURCHASE = "purchase"
+
+
+class EventInteraction(Base):
+    """
+    Tabla para tracking de interacciones usuario-evento
+    Usado por el sistema de recomendaciones IA
+    """
+    __tablename__ = "event_interactions"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    event_id = Column(Integer, ForeignKey("events.id"), nullable=False, index=True)
+    interaction_type = Column(Enum(InteractionType), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    
+    # Relaciones
+    user = relationship("User")
+    event = relationship("Event")
+
 
 # Crear tablas en la base de datos
 Base.metadata.create_all(bind=engine)
@@ -335,17 +360,439 @@ def get_my_tickets(
             
     return tickets_out
 
-# --- Endpoints de Eventos ---
-@events_router.get("/recommendations", tags=["AI"], response_model=list[EventOut])
-def get_event_recommendations(event_id: int | None = None, db: Session = Depends(get_db)):
+
+@users_router.get("/me/stats", tags=["AI"])
+def get_my_stats(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Retorna estadísticas del comportamiento del usuario
+    """
+    total_views = db.query(EventInteraction).filter(
+        EventInteraction.user_id == current_user.id,
+        EventInteraction.interaction_type == InteractionType.VIEW
+    ).count()
+    
+    total_clicks = db.query(EventInteraction).filter(
+        EventInteraction.user_id == current_user.id,
+        EventInteraction.interaction_type == InteractionType.CLICK
+    ).count()
+    
+    total_purchases = db.query(EventInteraction).filter(
+        EventInteraction.user_id == current_user.id,
+        EventInteraction.interaction_type == InteractionType.PURCHASE
+    ).count()
+    
+    # Categorías más compradas
+    purchases = db.query(EventInteraction).filter(
+        EventInteraction.user_id == current_user.id,
+        EventInteraction.interaction_type == InteractionType.PURCHASE
+    ).join(Event).all()
+    
+    category_counts = {}
+    for interaction in purchases:
+        cat = interaction.event.category or "Sin categoría"
+        category_counts[cat] = category_counts.get(cat, 0) + 1
+    
+    # Precio promedio
+    avg_price = 0
+    if purchases:
+        prices = [i.event.price for i in purchases]
+        avg_price = sum(prices) / len(prices)
+    
+    return {
+        "total_views": total_views,
+        "total_clicks": total_clicks,
+        "total_purchases": total_purchases,
+        "favorite_categories": category_counts,
+        "avg_ticket_price": round(avg_price, 2),
+        "engagement_score": min(100, (total_clicks * 2 + total_purchases * 10))
+    }
+
+
+# --- Sistema de Recomendaciones IA ---
+
+def calculate_recommendation_score(user_id: int, event: Event, db: Session) -> dict:
+    """
+    Calcula score personalizado (0-100) para un evento dado un usuario
+    Retorna: {"score": float, "reasons": list[str]}
+    """
+    score = 0.0
+    reasons = []
+    
+    # --- 1. PREFERENCIA DE CATEGORÍA (35%) ---
+    user_purchases = db.query(EventInteraction).filter(
+        EventInteraction.user_id == user_id,
+        EventInteraction.interaction_type == InteractionType.PURCHASE
+    ).join(Event).all()
+    
+    if user_purchases:
+        category_counts = {}
+        for interaction in user_purchases:
+            cat = interaction.event.category or "Sin categoría"
+            category_counts[cat] = category_counts.get(cat, 0) + 1
+        
+        total_purchases = len(user_purchases)
+        event_category = event.category or "Sin categoría"
+        
+        if event_category in category_counts:
+            category_pref = category_counts[event_category] / total_purchases
+            score += 35 * category_pref
+            
+            if category_pref > 0.3:
+                reasons.append(f"Te gusta {event_category}")
+    
+    # --- 2. SIMILITUD DE CONTENIDO (25%) ---
+    if user_purchases:
+        user_clicks = db.query(EventInteraction).filter(
+            EventInteraction.user_id == user_id,
+            EventInteraction.interaction_type.in_([InteractionType.CLICK, InteractionType.PURCHASE])
+        ).join(Event).all()
+        
+        user_profile = {
+            "categories": set(),
+            "price_range": []
+        }
+        
+        for interaction in user_clicks:
+            if interaction.event.category:
+                user_profile["categories"].add(interaction.event.category)
+            user_profile["price_range"].append(interaction.event.price)
+        
+        content_sim = 0.0
+        
+        if event.category in user_profile["categories"]:
+            content_sim += 0.7
+            reasons.append("Similar a eventos que te interesan")
+        
+        if user_profile["price_range"]:
+            avg_price = sum(user_profile["price_range"]) / len(user_profile["price_range"])
+            price_diff = abs(event.price - avg_price) / avg_price if avg_price > 0 else 0
+            
+            if price_diff < 0.3:
+                content_sim += 0.3
+        
+        score += 25 * content_sim
+    
+    # --- 3. POPULARIDAD (20%) ---
+    recent_date = datetime.utcnow() - timedelta(days=7)
+    
+    event_views = db.query(EventInteraction).filter(
+        EventInteraction.event_id == event.id,
+        EventInteraction.interaction_type == InteractionType.VIEW,
+        EventInteraction.created_at >= recent_date
+    ).count()
+    
+    event_purchases = db.query(EventInteraction).filter(
+        EventInteraction.event_id == event.id,
+        EventInteraction.interaction_type == InteractionType.PURCHASE,
+        EventInteraction.created_at >= recent_date
+    ).count()
+    
+    max_expected_views = 100
+    max_expected_purchases = 20
+    
+    popularity = (
+        (min(event_views, max_expected_views) / max_expected_views) * 0.6 +
+        (min(event_purchases, max_expected_purchases) / max_expected_purchases) * 0.4
+    )
+    
+    score += 20 * popularity
+    
+    if event_purchases > 5:
+        reasons.append("Popular esta semana")
+    
+    # --- 4. RECENCIA (10%) ---
+    days_until_event = (event.date - datetime.utcnow()).days
+    
+    recency = 0.0
+    
+    if 7 <= days_until_event <= 30:
+        recency = 1.0
+        reasons.append("Próximamente")
+    elif 0 <= days_until_event < 7:
+        recency = 0.7
+        reasons.append("¡Muy pronto!")
+    elif 30 < days_until_event <= 60:
+        recency = 0.5
+    
+    score += 10 * recency
+    
+    # --- 5. COMPATIBILIDAD DE PRECIO (5%) ---
+    if user_purchases:
+        prices = [i.event.price for i in user_purchases]
+        avg_price = sum(prices) / len(prices)
+        std_price = (sum((p - avg_price) ** 2 for p in prices) / len(prices)) ** 0.5
+        
+        if std_price > 0:
+            z_score = abs(event.price - avg_price) / std_price
+            
+            if z_score < 1:
+                score += 5
+                reasons.append("Precio acorde a tu histórico")
+            elif z_score < 2:
+                score += 2.5
+    
+    # --- 6. UBICACIÓN (5%) ---
+    if user_purchases:
+        location_counts = {}
+        for interaction in user_purchases:
+            loc = interaction.event.location
+            location_counts[loc] = location_counts.get(loc, 0) + 1
+        
+        if location_counts:
+            most_common_location = max(location_counts, key=location_counts.get)
+            
+            if event.location == most_common_location:
+                score += 5
+                reasons.append(f"En {event.location}")
+    
+    return {
+        "score": round(score, 2),
+        "reasons": reasons if reasons else ["Evento destacado"]
+    }
+
+
+def get_recommendations_for_user(user_id: int, event_id: int | None, limit: int, db: Session) -> list[dict]:
+    """
+    Obtiene recomendaciones personalizadas para un usuario
+    """
+    # Obtener eventos candidatos
     if event_id:
-        event = db.query(Event).filter(Event.id == event_id).first()
-        if not event:
-            raise HTTPException(status_code=404, detail="Event not found")
-        recommendations = db.query(Event).filter(Event.category == event.category, Event.id != event_id).all()
+        base_event = db.query(Event).filter(Event.id == event_id).first()
+        if not base_event:
+            candidates = db.query(Event).filter(Event.date > datetime.utcnow()).all()
+        else:
+            candidates = db.query(Event).filter(
+                Event.category == base_event.category,
+                Event.id != event_id,
+                Event.date > datetime.utcnow()
+            ).all()
+            
+            if len(candidates) < limit * 2:
+                other_candidates = db.query(Event).filter(
+                    Event.id != event_id,
+                    Event.date > datetime.utcnow()
+                ).limit(limit * 2).all()
+                candidates.extend(other_candidates)
     else:
-        recommendations = db.query(Event).all()
-    return recommendations
+        candidates = db.query(Event).filter(Event.date > datetime.utcnow()).all()
+    
+    # Eliminar duplicados
+    candidates = list({e.id: e for e in candidates}.values())
+    
+    # Calcular score para cada candidato
+    scored_events = []
+    for event in candidates:
+        result = calculate_recommendation_score(user_id, event, db)
+        scored_events.append({
+            "event": event,
+            "score": result["score"],
+            "reasons": result["reasons"]
+        })
+    
+    # Ordenar por score
+    scored_events.sort(key=lambda x: x["score"], reverse=True)
+    
+    return scored_events[:limit]
+
+
+def get_cold_start_recommendations(event_id: int | None, limit: int, db: Session) -> list[Event]:
+    """
+    Para usuarios nuevos sin historial: eventos populares + próximos
+    """
+    recent_date = datetime.utcnow() - timedelta(days=7)
+    
+    if event_id:
+        base_event = db.query(Event).filter(Event.id == event_id).first()
+        if base_event:
+            return db.query(Event).filter(
+                Event.category == base_event.category,
+                Event.id != event_id,
+                Event.date > datetime.utcnow()
+            ).order_by(Event.date).limit(limit).all()
+    
+    # Eventos populares (más ventas recientes)
+    from sqlalchemy import desc
+    popular_event_ids = db.query(
+        EventInteraction.event_id,
+        func.count(EventInteraction.id).label('count')
+    ).filter(
+        EventInteraction.interaction_type == InteractionType.PURCHASE,
+        EventInteraction.created_at >= recent_date
+    ).group_by(EventInteraction.event_id).order_by(desc('count')).limit(limit).all()
+    
+    if popular_event_ids:
+        event_ids = [e.event_id for e in popular_event_ids]
+        return db.query(Event).filter(
+            Event.id.in_(event_ids),
+            Event.date > datetime.utcnow()
+        ).all()
+    
+    # Fallback: eventos próximos
+    return db.query(Event).filter(Event.date > datetime.utcnow()).order_by(Event.date).limit(limit).all()
+
+
+def get_current_user_optional(
+    authorization: str | None = Depends(lambda: None),
+    db: Session = Depends(get_db)
+) -> User | None:
+    """
+    Dependency que retorna el usuario si está autenticado, sino None
+    """
+    from fastapi import Header
+    
+    if not authorization:
+        return None
+    
+    if not authorization.startswith("Bearer "):
+        return None
+    
+    try:
+        token = authorization.replace("Bearer ", "")
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email = payload.get("sub")
+        if email is None:
+            return None
+        
+        user = db.query(User).filter(User.email == email).first()
+        return user
+    except:
+        return None
+
+
+# --- Endpoints de Eventos ---
+@events_router.get("/recommendations", tags=["AI"])
+def get_event_recommendations(
+    event_id: int | None = None,
+    limit: int = 10,
+    authorization: str | None = Header(None, alias="Authorization"),
+    db: Session = Depends(get_db)
+):
+    """
+    Endpoint de recomendaciones mejorado con IA
+    
+    - Si hay usuario autenticado → recomendaciones personalizadas
+    - Si no hay usuario → eventos populares (cold start)
+    - Si hay event_id → eventos similares a ese evento
+    
+    Retorna eventos con score y reasons
+    """
+    # Intentar obtener usuario autenticado
+    current_user = None
+    if authorization and authorization.startswith("Bearer "):
+        try:
+            token = authorization.replace("Bearer ", "")
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            email = payload.get("sub")
+            if email:
+                current_user = db.query(User).filter(User.email == email).first()
+        except:
+            pass
+    
+    # Usuario autenticado → personalizado
+    if current_user:
+        has_history = db.query(EventInteraction).filter(
+            EventInteraction.user_id == current_user.id
+        ).first() is not None
+        
+        if has_history:
+            recommendations = get_recommendations_for_user(current_user.id, event_id, limit, db)
+            return [
+                {
+                    "id": rec["event"].id,
+                    "name": rec["event"].name,
+                    "description": rec["event"].description,
+                    "date": rec["event"].date.isoformat(),
+                    "location": rec["event"].location,
+                    "price": rec["event"].price,
+                    "total_tickets": rec["event"].total_tickets,
+                    "category": rec["event"].category,
+                    "image_url": rec["event"].image_url,
+                    "owner_id": rec["event"].owner_id,
+                    "recommendation_score": rec["score"],
+                    "reasons": rec["reasons"]
+                }
+                for rec in recommendations
+            ]
+    
+    # Usuario sin historial o no autenticado → cold start
+    cold_start_events = get_cold_start_recommendations(event_id, limit, db)
+    
+    return [
+        {
+            "id": event.id,
+            "name": event.name,
+            "description": event.description,
+            "date": event.date.isoformat(),
+            "location": event.location,
+            "price": event.price,
+            "total_tickets": event.total_tickets,
+            "category": event.category,
+            "image_url": event.image_url,
+            "owner_id": event.owner_id,
+            "recommendation_score": 50.0,
+            "reasons": ["Evento destacado"]
+        }
+        for event in cold_start_events
+    ]
+
+
+@events_router.post("/{event_id}/interactions", tags=["AI"])
+def track_event_interaction(
+    event_id: int,
+    interaction_type: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Registra interacción del usuario con un evento
+    
+    Tipos: "view", "click", "purchase"
+    """
+    # Validar tipo
+    valid_types = ["view", "click", "purchase"]
+    if interaction_type not in valid_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid interaction_type. Must be one of: {valid_types}"
+        )
+    
+    # Validar que el evento existe
+    event = db.query(Event).filter(Event.id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    
+    # Evitar duplicados muy cercanos (debounce de 30 segundos para views)
+    if interaction_type == "view":
+        recent_interaction = db.query(EventInteraction).filter(
+            EventInteraction.user_id == current_user.id,
+            EventInteraction.event_id == event_id,
+            EventInteraction.interaction_type == InteractionType.VIEW,
+            EventInteraction.created_at >= datetime.utcnow() - timedelta(seconds=30)
+        ).first()
+        
+        if recent_interaction:
+            return {"status": "already_tracked", "message": "Recent view already tracked"}
+    
+    # Crear interacción
+    interaction = EventInteraction(
+        user_id=current_user.id,
+        event_id=event_id,
+        interaction_type=InteractionType(interaction_type),
+        created_at=datetime.utcnow()
+    )
+    
+    db.add(interaction)
+    db.commit()
+    
+    return {
+        "status": "success",
+        "interaction_id": interaction.id,
+        "message": f"Interaction '{interaction_type}' tracked for event {event_id}"
+    }
+
 
 @events_router.post("", response_model=EventOut)
 async def create_event(
@@ -535,6 +982,20 @@ def purchase_ticket(
     db.add(new_ticket_db)
     db.commit()
     db.refresh(new_ticket_db)
+    
+    # --- Tracking automático de compra para sistema de recomendaciones ---
+    try:
+        purchase_interaction = EventInteraction(
+            user_id=current_user.id,
+            event_id=event.id,
+            interaction_type=InteractionType.PURCHASE,
+            created_at=datetime.utcnow()
+        )
+        db.add(purchase_interaction)
+        db.commit()
+    except Exception as e:
+        # No fallar la compra si el tracking falla
+        print(f"Warning: Could not track purchase interaction: {e}")
 
     return {
         "message": "Ticket purchased and minted successfully", 
