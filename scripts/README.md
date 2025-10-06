@@ -25,12 +25,6 @@ organizador compartido.
      --limit 3 \
      --dry-run
    ```
-    ```bash
-   python scripts/import_ticketmaster_events.py \
-     --organiser-email organizador@example.com \
-     --organiser-password organizador123 \
-     --limit 3 
-   ```
 
    Salida esperada (se omite parte del texto):
    ```
@@ -48,18 +42,22 @@ organizador compartido.
    python scripts/import_ticketmaster_events.py \
      --organiser-email organizador@example.com \
      --organiser-password organizador123 \
-     --total-tickets 500
+     --total-tickets 500 \
+     --fallback-price 50
    ```
 
    Si el usuario organizador no existe, el script lo crea automaticamente. Los eventos se actualizan
-   por coincidencia de nombre + fecha, preservando la cuenta `organizador@example.com` como owner.
+   por coincidencia de nombre + fecha, preservando la cuenta `organizador@example.com` como owner. Si
+   Ticketmaster oculta los precios, se asigna el fallback indicado (50 EUR por defecto).
 
 ### Opciones adicionales
 - `--city-url` permite apuntar a otra ciudad de Ticketmaster Discover.
 - `--keep-remote-images` evita descargar las imagenes y mantiene la URL remota.
 - `--limit N` limita el numero de eventos importados.
 - `--total-tickets` fija cuantos boletos se asignan por evento (por defecto 500).
+- `--fallback-price` define el precio por defecto (EUR) cuando Ticketmaster no expone valores reales (50 por defecto).
 
 Cada ejecucion valida/crea el usuario organizador indicado y realiza *upsert*
 sobre eventos coincidentes por nombre y fecha; se actualizan descripcion, lugar,
-precio, categoria e imagen cuando cambian.
+precio, categoria e imagen cuando cambian. Los eventos con precios ocultos o
+inaccesibles quedan con el fallback configurado.

@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit, parse_qsl, urlencode
 
 import requests
 from requests import Session
@@ -34,6 +34,7 @@ DEFAULT_HEADERS = {
 REQUEST_TIMEOUT = 20
 NEXT_DATA_RE = re.compile(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.DOTALL)
 DEFAULT_TOTAL_TICKETS = 500
+DEFAULT_FALLBACK_PRICE = 50.0
 SUPPORTED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 
 
@@ -136,20 +137,53 @@ def fetch_json(session: Session, url: str, *, referer: Optional[str] = None) -> 
         raise TicketmasterError(f'Invalid JSON payload from {url}') from exc
 
 
-def fetch_city_payload(session: Session, city_url: str) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
-    response = session.get(city_url, headers=DEFAULT_HEADERS, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
-    next_data = parse_next_data(response.text)
-    page_props = next_data["props"]["pageProps"]
-    state = page_props["initialReduxState"]
-    queries = state["api"]["queries"]
-    city_key = next((key for key in queries if key.startswith("cityEvents")), None)
-    if not city_key:
-        raise TicketmasterError("cityEvents query not found in initial Redux state")
 
-    events = queries[city_key]["data"]["events"]
-    jsonld_map = flatten_events_jsonld(page_props.get("eventsJsonLD"))
-    return events, jsonld_map
+def build_city_page_url(base_url: str, page: int) -> str:
+    parsed = urlsplit(base_url)
+    query = dict(parse_qsl(parsed.query))
+    query['page'] = str(page)
+    new_query = urlencode(query, doseq=True)
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, new_query, parsed.fragment))
+
+
+def fetch_city_payload(session: Session, city_url: str, *, limit: Optional[int] = None) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    aggregated_events: List[Dict[str, Any]] = []
+    aggregated_jsonld: Dict[str, Dict[str, Any]] = {}
+    total_available: Optional[int] = None
+    page = 0
+    while True:
+        page_url = build_city_page_url(city_url, page)
+        response = session.get(page_url, headers=DEFAULT_HEADERS, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        next_data = parse_next_data(response.text)
+        page_props = next_data["props"]["pageProps"]
+        state = page_props["initialReduxState"]
+        queries = state["api"]["queries"]
+        city_key = next((key for key in queries if key.startswith("cityEvents")), None)
+        if not city_key:
+            raise TicketmasterError("cityEvents query not found in initial Redux state")
+
+        data = queries[city_key]["data"]
+        events = data.get("events", []) or []
+        if not events:
+            break
+
+        aggregated_events.extend(events)
+        aggregated_jsonld.update(flatten_events_jsonld(page_props.get("eventsJsonLD")))
+
+        if total_available is None:
+            total_available = data.get("total")
+
+        if limit is not None and len(aggregated_events) >= limit:
+            break
+        if total_available is not None and len(aggregated_events) >= total_available:
+            break
+
+        page += 1
+
+    if limit is not None and len(aggregated_events) > limit:
+        aggregated_events = aggregated_events[:limit]
+    return aggregated_events, aggregated_jsonld
 
 
 def extract_price(ticket_selection: Dict[str, Any]) -> Optional[float]:
@@ -195,13 +229,18 @@ def build_event_payloads(
     total_tickets: int,
     download_images: bool,
     image_dir: Path,
+    fallback_price: float,
 ) -> List[EventPayload]:
     payloads: List[EventPayload] = []
+    seen_event_ids: set[str] = set()
     for entry in events:
         if limit is not None and len(payloads) >= limit:
             break
 
         event_id = str(entry.get("id"))
+        if not event_id or event_id in seen_event_ids:
+            continue
+        seen_event_ids.add(event_id)
         source_url = entry.get("url") or ""
         jsonld = jsonld_map.get(source_url, {})
 
@@ -226,6 +265,7 @@ def build_event_payloads(
         elif event_info.get("primaryCategory"):
             category = event_info["primaryCategory"].get("title")
 
+        price = fallback_price
         try:
             ticket_selection = fetch_json(
                 session,
@@ -233,9 +273,13 @@ def build_event_payloads(
                 referer=source_url,
             )
         except TicketmasterError as exc:
-            print(f"Skipping {event_id}: {exc}")
-            continue
-        price = extract_price(ticket_selection) or 0.0
+            print(f"Price unavailable for {event_id}: {exc}. Using fallback {fallback_price:.2f}.")
+        else:
+            extracted_price = extract_price(ticket_selection)
+            if extracted_price is not None:
+                price = extracted_price
+            else:
+                print(f"Price data missing for {event_id}; using fallback {fallback_price:.2f}.")
 
         image_url = event_info.get("imageUrl")
         if download_images and image_url:
@@ -358,6 +402,7 @@ def main() -> None:
     parser.add_argument("--organiser-email", default="organizador@example.com", help="Email for the shared organiser account")
     parser.add_argument("--organiser-password", default="organizador123", help="Password for the organiser account")
     parser.add_argument("--total-tickets", type=int, default=DEFAULT_TOTAL_TICKETS, help="Tickets to assign to each imported event")
+    parser.add_argument("--fallback-price", type=float, default=DEFAULT_FALLBACK_PRICE, help="Fallback price in EUR when Ticketmaster hides ticket prices")
     parser.add_argument("--keep-remote-images", action="store_true", help="Store Ticketmaster image URLs instead of downloading copies")
     parser.add_argument("--dry-run", action="store_true", help="Only print the actions without touching the database")
 
@@ -367,7 +412,7 @@ def main() -> None:
 
     session = Session()
     try:
-        events, jsonld_map = fetch_city_payload(session, args.city_url)
+        events, jsonld_map = fetch_city_payload(session, args.city_url, limit=args.limit)
         payloads = build_event_payloads(
             session,
             events,
@@ -376,6 +421,7 @@ def main() -> None:
             total_tickets=max(1, args.total_tickets),
             download_images=not args.keep_remote_images,
             image_dir=project_root / "static" / "event_images",
+            fallback_price=max(0.0, args.fallback_price),
         )
     finally:
         session.close()
