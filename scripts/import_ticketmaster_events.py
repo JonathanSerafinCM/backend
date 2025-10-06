@@ -125,9 +125,15 @@ def fetch_json(session: Session, url: str, *, referer: Optional[str] = None) -> 
     headers = DEFAULT_HEADERS.copy()
     if referer:
         headers["Referer"] = referer
-    response = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
-    return response.json()
+    try:
+        response = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise TicketmasterError(f'GET {url} failed: {exc}') from exc
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise TicketmasterError(f'Invalid JSON payload from {url}') from exc
 
 
 def fetch_city_payload(session: Session, city_url: str) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
@@ -208,7 +214,11 @@ def build_event_payloads(
         location_parts = [venue.get("name"), venue.get("city")]
         location = ", ".join(part for part in location_parts if part)
 
-        event_info = fetch_json(session, f"https://www.ticketmaster.es/api/eventinfo/{event_id}", referer=source_url)
+        try:
+            event_info = fetch_json(session, f"https://www.ticketmaster.es/api/eventinfo/{event_id}", referer=source_url)
+        except TicketmasterError as exc:
+            print(f"Skipping {event_id}: {exc}")
+            continue
         description = clean_description(event_info.get("webInfoNoHtml") or jsonld.get("description"))
         category = None
         if event_info.get("subCategory"):
@@ -216,11 +226,15 @@ def build_event_payloads(
         elif event_info.get("primaryCategory"):
             category = event_info["primaryCategory"].get("title")
 
-        ticket_selection = fetch_json(
-            session,
-            f"https://www.ticketmaster.es/api/ticketselection/{event_id}",
-            referer=source_url,
-        )
+        try:
+            ticket_selection = fetch_json(
+                session,
+                f"https://www.ticketmaster.es/api/ticketselection/{event_id}",
+                referer=source_url,
+            )
+        except TicketmasterError as exc:
+            print(f"Skipping {event_id}: {exc}")
+            continue
         price = extract_price(ticket_selection) or 0.0
 
         image_url = event_info.get("imageUrl")

@@ -25,6 +25,12 @@ organizador compartido.
      --limit 3 \
      --dry-run
    ```
+    ```bash
+   python scripts/import_ticketmaster_events.py \
+     --organiser-email organizador@example.com \
+     --organiser-password organizador123 \
+     --limit 3 
+   ```
 
    Salida esperada (se omite parte del texto):
    ```
