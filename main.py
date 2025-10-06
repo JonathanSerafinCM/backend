@@ -169,6 +169,9 @@ class Token(BaseModel):
 class TokenData(BaseModel):
     email: str | None = None
 
+class InteractionCreate(BaseModel):
+    interaction_type: str
+
 # --- Seguridad y Hashing ---
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 SECRET_KEY = os.getenv("SECRET_KEY", "a_super_secret_key_that_should_be_in_env")
@@ -742,7 +745,7 @@ def get_event_recommendations(
 @events_router.post("/{event_id}/interactions", tags=["AI"])
 def track_event_interaction(
     event_id: int,
-    interaction_type: str,
+    interaction_data: InteractionCreate,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -751,6 +754,8 @@ def track_event_interaction(
     
     Tipos: "view", "click", "purchase"
     """
+    interaction_type = interaction_data.interaction_type
+    
     # Validar tipo
     valid_types = ["view", "click", "purchase"]
     if interaction_type not in valid_types:
