@@ -621,6 +621,82 @@ def get_event_purchases(
         "purchases": purchases
     }
 
+# --- Endpoint para obtener asistentes/clientes de un evento ---
+@events_router.get("/{event_id}/attendees", tags=["Analytics"])
+def get_event_attendees(
+    event_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    # Verificar que el evento existe
+    event = db.query(Event).filter(Event.id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    
+    # Verificar que el usuario actual es el organizador del evento
+    if current_user.role != UserRole.ORGANIZADOR or event.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="You are not authorized to view attendees for this event")
+    
+    # Obtener todos los tickets vendidos para este evento
+    tickets = db.query(Ticket).filter(Ticket.event_id == event_id).all()
+    
+    # Agrupar tickets por wallet address (cliente único)
+    attendees_dict = {}
+    
+    for ticket in tickets:
+        wallet = ticket.owner_wallet_address
+        
+        if wallet not in attendees_dict:
+            # Buscar información del usuario
+            buyer = db.query(User).filter(User.wallet_address == wallet).first()
+            
+            attendees_dict[wallet] = {
+                "email": buyer.email if buyer else "Desconocido",
+                "wallet_address": wallet,
+                "tickets_count": 0,
+                "total_spent": 0.0,
+                "first_purchase_date": ticket.purchase_date,
+                "last_purchase_date": ticket.purchase_date,
+                "ticket_ids": []
+            }
+        
+        # Actualizar información del asistente
+        attendees_dict[wallet]["tickets_count"] += 1
+        attendees_dict[wallet]["total_spent"] += event.price
+        attendees_dict[wallet]["ticket_ids"].append(ticket.ticket_id_onchain)
+        
+        # Actualizar fechas
+        if ticket.purchase_date:
+            if not attendees_dict[wallet]["first_purchase_date"] or ticket.purchase_date < attendees_dict[wallet]["first_purchase_date"]:
+                attendees_dict[wallet]["first_purchase_date"] = ticket.purchase_date
+            
+            if not attendees_dict[wallet]["last_purchase_date"] or ticket.purchase_date > attendees_dict[wallet]["last_purchase_date"]:
+                attendees_dict[wallet]["last_purchase_date"] = ticket.purchase_date
+    
+    # Convertir a lista y formatear fechas
+    attendees_list = []
+    for attendee_data in attendees_dict.values():
+        attendees_list.append({
+            "email": attendee_data["email"],
+            "wallet_address": attendee_data["wallet_address"],
+            "tickets_count": attendee_data["tickets_count"],
+            "total_spent": round(attendee_data["total_spent"], 2),
+            "first_purchase_date": attendee_data["first_purchase_date"].isoformat() if attendee_data["first_purchase_date"] else None,
+            "last_purchase_date": attendee_data["last_purchase_date"].isoformat() if attendee_data["last_purchase_date"] else None,
+            "ticket_ids": attendee_data["ticket_ids"]
+        })
+    
+    # Ordenar por cantidad de tickets (mayor a menor)
+    attendees_list.sort(key=lambda x: x["tickets_count"], reverse=True)
+    
+    return {
+        "event_id": event_id,
+        "event_name": event.name,
+        "total_attendees": len(attendees_list),
+        "total_tickets_sold": len(tickets),
+        "attendees": attendees_list
+    }
+
 # --- Endpoint para obtener estadísticas del organizador ---
 @admin_router.get("/analytics/organizer-stats", tags=["Analytics"])
 def get_organizer_stats(
