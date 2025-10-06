@@ -4,20 +4,23 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import uuid
+from collections import defaultdict
 
 from dotenv import load_dotenv
 
-from fastapi import Depends, FastAPI, HTTPException, APIRouter, UploadFile, File, Form, Header
+from fastapi import Depends, FastAPI, HTTPException, APIRouter, UploadFile, File, Form, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel
+from typing import Any, Dict, Optional, Tuple
 from sqlalchemy import (Column, create_engine, DateTime, Enum, Float,
-                        ForeignKey, Integer, String, func, Boolean)
+                        ForeignKey, Integer, String, func, Boolean, Index, case)
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker, Session
 from web3 import Web3
+from threading import Lock
 
 # Cargar variables de entorno
 load_dotenv(encoding='utf-8', override=True)
@@ -38,6 +41,7 @@ Base = declarative_base()
 class UserRole(str, enum.Enum):
     COMPRADOR = "comprador"
     ORGANIZADOR = "organizador"
+    ADMIN = "admin"
 
 # --- Modelos de la Base de Datos (SQLAlchemy) ---
 class User(Base):
@@ -62,7 +66,7 @@ class Event(Base):
     image_url = Column(String, nullable=True)
     total_revenue = Column(Float, default=0.0) # To track revenue
     is_funds_withdrawn = Column(Boolean, default=False) # To simulate fund withdrawal
-    owner_id = Column(Integer, ForeignKey("users.id"))
+    owner_id = Column(Integer, ForeignKey("users.id"), index=True)
     owner = relationship("User", back_populates="events")
     tickets = relationship("Ticket", back_populates="event") # Relación con tickets
     @property
@@ -108,12 +112,82 @@ class EventInteraction(Base):
     event = relationship("Event")
 
 
+Index(
+    "ix_event_interactions_event_type_created_at",
+    EventInteraction.event_id,
+    EventInteraction.interaction_type,
+    EventInteraction.created_at
+)
+Index(
+    "ix_event_interactions_user_created_at",
+    EventInteraction.user_id,
+    EventInteraction.created_at
+)
+
+
 # Crear tablas en la base de datos
 Base.metadata.create_all(bind=engine)
 
 # Directory for storing event images
 STATIC_UPLOAD_DIR = Path('static/event_images')
 STATIC_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+CACHE_TTL_SECONDS = max(60, min(120, int(os.getenv("ORGANIZER_ANALYTICS_CACHE_TTL", "90"))))
+_analytics_cache: Dict[str, Tuple[datetime, Dict[str, Any]]] = {}
+_analytics_cache_lock = Lock()
+
+
+def _make_cache_key(organizer_scope: Optional[int], event_id: Optional[int], days: int) -> str:
+    scope = organizer_scope if organizer_scope is not None else "all"
+    event = event_id if event_id is not None else "all"
+    return f"{scope}:{event}:{days}"
+
+
+def _get_cached_analytics(key: str) -> Optional[Dict[str, Any]]:
+    with _analytics_cache_lock:
+        entry = _analytics_cache.get(key)
+        if not entry:
+            return None
+        timestamp, payload = entry
+        if datetime.utcnow() - timestamp > timedelta(seconds=CACHE_TTL_SECONDS):
+            _analytics_cache.pop(key, None)
+            return None
+        return payload
+
+
+def _set_cached_analytics(key: str, value: Dict[str, Any]) -> None:
+    with _analytics_cache_lock:
+        _analytics_cache[key] = (datetime.utcnow(), value)
+
+
+def invalidate_analytics_cache() -> None:
+    with _analytics_cache_lock:
+        _analytics_cache.clear()
+
+
+def _build_empty_overview(days: int, event_id: Optional[int], organizer_scope: Optional[int]) -> Dict[str, Any]:
+    return {
+        "period_days": days,
+        "filters": {
+            "event_id": event_id,
+            "organizer_id": organizer_scope,
+        },
+        "kpis": {
+            "ctr_pct": 0.0,
+            "rec_conversion_pct": 0.0,
+            "coverage_pct": 0.0,
+            "avg_interactions_per_user": 0.0,
+        },
+        "timeseries": {
+            "daily": []
+        },
+        "tops": {
+            "events_by_sales": [],
+            "categories_by_sales": []
+        },
+        "inventory": []
+    }
 
 
 # --- Schemas (Pydantic) ---
@@ -257,6 +331,7 @@ events_router = APIRouter(prefix="/events", tags=["Events"])
 web3_router = APIRouter(prefix="/tickets", tags=["Blockchain"])
 metadata_router = APIRouter(prefix="/metadata", tags=["Metadata"])
 admin_router = APIRouter(prefix="/admin", tags=["Admin"])
+organizer_router = APIRouter(prefix="/organizer", tags=["Organizer Analytics"])
 
 # --- Endpoints de Autenticación ---
 @auth_router.post("/register", response_model=UserOut)
@@ -791,6 +866,7 @@ def track_event_interaction(
     
     db.add(interaction)
     db.commit()
+    invalidate_analytics_cache()
     
     return {
         "status": "success",
@@ -846,6 +922,7 @@ async def create_event(
     db.add(new_event)
     db.commit()
     db.refresh(new_event)
+    invalidate_analytics_cache()
     return new_event
 
 @events_router.get("", response_model=list[EventOut])
@@ -881,6 +958,7 @@ def update_event(
     
     db.commit()
     db.refresh(event)
+    invalidate_analytics_cache()
     return event
 
 @events_router.post("/{event_id}/simulate-withdrawal")
@@ -900,6 +978,7 @@ def simulate_withdraw_funds(
     # Simulate fund withdrawal
     event.is_funds_withdrawn = True
     db.commit()
+    invalidate_analytics_cache()
     
     return {"message": f"Funds for event '{event.name}' marked as withdrawn (simulated).", "amount": event.total_revenue}
 
@@ -920,6 +999,7 @@ def delete_event(
 
     db.delete(event)
     db.commit()
+    invalidate_analytics_cache()
     return {"detail": "Event deleted successfully"}
 
 @events_router.post("/{event_id}/purchase", tags=["Blockchain"])
@@ -1001,6 +1081,8 @@ def purchase_ticket(
     except Exception as e:
         # No fallar la compra si el tracking falla
         print(f"Warning: Could not track purchase interaction: {e}")
+
+    invalidate_analytics_cache()
 
     return {
         "message": "Ticket purchased and minted successfully", 
@@ -1090,6 +1172,261 @@ def get_ticket_metadata(ticket_id: int, db: Session = Depends(get_db)):
         ],
     }
     return metadata
+
+@organizer_router.get("/analytics/overview", tags=["Analytics"])
+def get_organizer_analytics_overview(
+    days: int = Query(30, ge=7, le=180),
+    event_id: int | None = Query(None),
+    organizer_id: int | None = Query(None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role not in {UserRole.ORGANIZADOR, UserRole.ADMIN}:
+        raise HTTPException(status_code=403, detail="Not authorized to access organizer analytics")
+
+    if current_user.role == UserRole.ORGANIZADOR:
+        scope_organizer_id = current_user.id
+        if organizer_id is not None and organizer_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Not authorized to query other organizers")
+    else:
+        scope_organizer_id = organizer_id
+
+    if event_id is not None:
+        event = db.query(Event).filter(Event.id == event_id).first()
+        if not event:
+            raise HTTPException(status_code=404, detail="Event not found")
+        if current_user.role == UserRole.ORGANIZADOR and event.owner_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Event not accessible for this organizer")
+        if scope_organizer_id is not None and event.owner_id != scope_organizer_id:
+            raise HTTPException(status_code=403, detail="Event not associated to selected organizer")
+
+    cache_key = _make_cache_key(scope_organizer_id, event_id, days)
+    cached = _get_cached_analytics(cache_key)
+    if cached:
+        return cached
+
+    events_query = db.query(Event)
+    if scope_organizer_id is not None:
+        events_query = events_query.filter(Event.owner_id == scope_organizer_id)
+    if event_id is not None:
+        events_query = events_query.filter(Event.id == event_id)
+
+    events = events_query.all()
+    event_ids = [event.id for event in events]
+
+    if not event_ids:
+        empty_response = _build_empty_overview(days, event_id, scope_organizer_id)
+        _set_cached_analytics(cache_key, empty_response)
+        return empty_response
+
+    now_utc = datetime.utcnow()
+    start_dt = (now_utc - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
+    end_dt = now_utc
+    window_threshold = start_dt - timedelta(hours=24)
+
+    views_reco = db.query(func.count(EventInteraction.id)).filter(
+        EventInteraction.interaction_type == InteractionType.VIEW,
+        EventInteraction.event_id.in_(event_ids),
+        EventInteraction.created_at >= start_dt,
+        EventInteraction.created_at <= end_dt
+    ).scalar() or 0
+
+    clicks_reco = db.query(func.count(EventInteraction.id)).filter(
+        EventInteraction.interaction_type == InteractionType.CLICK,
+        EventInteraction.event_id.in_(event_ids),
+        EventInteraction.created_at >= start_dt,
+        EventInteraction.created_at <= end_dt
+    ).scalar() or 0
+
+    total_interactions = db.query(func.count(EventInteraction.id)).filter(
+        EventInteraction.event_id.in_(event_ids),
+        EventInteraction.created_at >= start_dt,
+        EventInteraction.created_at <= end_dt
+    ).scalar() or 0
+
+    active_users_query = db.query(EventInteraction.user_id).filter(
+        EventInteraction.event_id.in_(event_ids),
+        EventInteraction.created_at >= start_dt,
+        EventInteraction.created_at <= end_dt
+    ).distinct()
+    active_user_ids = [row[0] for row in active_users_query]
+
+    if active_user_ids:
+        users_with_history = [
+            row[0]
+            for row in db.query(EventInteraction.user_id).filter(
+                EventInteraction.user_id.in_(active_user_ids),
+                EventInteraction.event_id.in_(event_ids),
+                EventInteraction.interaction_type == InteractionType.PURCHASE
+            ).distinct()
+        ]
+    else:
+        users_with_history = []
+
+    purchase_rows = db.query(
+        EventInteraction.user_id,
+        EventInteraction.event_id,
+        EventInteraction.created_at
+    ).filter(
+        EventInteraction.interaction_type == InteractionType.PURCHASE,
+        EventInteraction.event_id.in_(event_ids),
+        EventInteraction.created_at >= start_dt,
+        EventInteraction.created_at <= end_dt
+    ).all()
+
+    total_purchases = len(purchase_rows)
+
+    relevant_views_clicks = db.query(
+        EventInteraction.user_id,
+        EventInteraction.event_id,
+        EventInteraction.created_at
+    ).filter(
+        EventInteraction.interaction_type.in_([InteractionType.VIEW, InteractionType.CLICK]),
+        EventInteraction.event_id.in_(event_ids),
+        EventInteraction.created_at >= window_threshold,
+        EventInteraction.created_at <= end_dt
+    ).all()
+
+    interaction_map: Dict[Tuple[int, int], list[datetime]] = defaultdict(list)
+    for row in relevant_views_clicks:
+        interaction_map[(row.user_id, row.event_id)].append(row.created_at)
+
+    for timestamps in interaction_map.values():
+        timestamps.sort()
+
+    purchases_from_recs = 0
+    for user_id_value, event_id_value, purchase_created_at in purchase_rows:
+        window_start = purchase_created_at - timedelta(hours=24)
+        timestamps = interaction_map.get((user_id_value, event_id_value), [])
+        if any(window_start <= ts <= purchase_created_at for ts in timestamps):
+            purchases_from_recs += 1
+
+    ctr_pct = round((clicks_reco / views_reco) * 100, 2) if views_reco else 0.0
+    rec_conversion_pct = round((purchases_from_recs / total_purchases) * 100, 2) if total_purchases else 0.0
+    coverage_pct = round((len(users_with_history) / len(active_user_ids)) * 100, 2) if active_user_ids else 0.0
+    avg_interactions_per_user = round((total_interactions / len(active_user_ids)), 2) if active_user_ids else 0.0
+
+    daily_rows = db.query(
+        func.date(EventInteraction.created_at).label("day"),
+        func.sum(case((EventInteraction.interaction_type == InteractionType.VIEW, 1), else_=0)).label("views"),
+        func.sum(case((EventInteraction.interaction_type == InteractionType.CLICK, 1), else_=0)).label("clicks"),
+        func.sum(case((EventInteraction.interaction_type == InteractionType.PURCHASE, 1), else_=0)).label("purchases")
+    ).filter(
+        EventInteraction.event_id.in_(event_ids),
+        EventInteraction.created_at >= start_dt,
+        EventInteraction.created_at <= end_dt
+    ).group_by(func.date(EventInteraction.created_at)).order_by(func.date(EventInteraction.created_at)).all()
+
+    daily_map = {row.day: {"views": int(row.views or 0), "clicks": int(row.clicks or 0), "purchases": int(row.purchases or 0)} for row in daily_rows}
+
+    daily_series = []
+    current_date = start_dt.date()
+    end_date = end_dt.date()
+    while current_date <= end_date:
+        metrics = daily_map.get(current_date, {"views": 0, "clicks": 0, "purchases": 0})
+        daily_series.append({
+            "date": current_date.isoformat(),
+            "views": metrics["views"],
+            "clicks": metrics["clicks"],
+            "purchases": metrics["purchases"],
+        })
+        current_date += timedelta(days=1)
+
+    tops_events_query = db.query(
+        Event.id,
+        Event.name,
+        func.count(EventInteraction.id).label("purchases")
+    ).join(Event, Event.id == EventInteraction.event_id).filter(
+        EventInteraction.interaction_type == InteractionType.PURCHASE,
+        EventInteraction.created_at >= start_dt,
+        EventInteraction.created_at <= end_dt
+    )
+
+    if scope_organizer_id is not None:
+        tops_events_query = tops_events_query.filter(Event.owner_id == scope_organizer_id)
+    if event_id is not None:
+        tops_events_query = tops_events_query.filter(Event.id == event_id)
+
+    tops_events = tops_events_query.group_by(Event.id, Event.name).order_by(func.count(EventInteraction.id).desc()).limit(5).all()
+    events_by_sales = [
+        {"event_id": ev_id, "name": name, "purchases": purchases}
+        for ev_id, name, purchases in tops_events
+    ]
+
+    tops_categories_query = db.query(
+        func.coalesce(Event.category, "Sin categoría").label("category"),
+        func.count(EventInteraction.id).label("purchases")
+    ).join(Event, Event.id == EventInteraction.event_id).filter(
+        EventInteraction.interaction_type == InteractionType.PURCHASE,
+        EventInteraction.created_at >= start_dt,
+        EventInteraction.created_at <= end_dt
+    )
+
+    if scope_organizer_id is not None:
+        tops_categories_query = tops_categories_query.filter(Event.owner_id == scope_organizer_id)
+    if event_id is not None:
+        tops_categories_query = tops_categories_query.filter(Event.id == event_id)
+
+    tops_categories = tops_categories_query.group_by(func.coalesce(Event.category, "Sin categoría")).order_by(func.count(EventInteraction.id).desc()).limit(5).all()
+    categories_by_sales = [
+        {"category": category, "purchases": purchases}
+        for category, purchases in tops_categories
+    ]
+
+    inventory_query = db.query(Event)
+    if scope_organizer_id is not None:
+        inventory_query = inventory_query.filter(Event.owner_id == scope_organizer_id)
+    if event_id is not None:
+        inventory_query = inventory_query.filter(Event.id == event_id)
+    else:
+        inventory_query = inventory_query.filter(Event.date >= now_utc)
+
+    inventory_events = inventory_query.order_by(Event.date).all()
+    inventory_list = []
+    if inventory_events:
+        inventory_event_ids = [evt.id for evt in inventory_events]
+        sold_rows = db.query(
+            Ticket.event_id,
+            func.count(Ticket.id).label("sold")
+        ).filter(
+            Ticket.event_id.in_(inventory_event_ids)
+        ).group_by(Ticket.event_id).all()
+        sold_map = {event_id_value: sold for event_id_value, sold in sold_rows}
+
+        for evt in inventory_events:
+            sold = int(sold_map.get(evt.id, 0))
+            available = max(int(evt.total_tickets), 0)
+            inventory_list.append({
+                "event_id": evt.id,
+                "name": evt.name,
+                "sold": sold,
+                "available": available
+            })
+
+    response_payload = {
+        "period_days": days,
+        "filters": {
+            "event_id": event_id,
+            "organizer_id": scope_organizer_id,
+        },
+        "kpis": {
+            "ctr_pct": ctr_pct,
+            "rec_conversion_pct": rec_conversion_pct,
+            "coverage_pct": coverage_pct,
+            "avg_interactions_per_user": avg_interactions_per_user,
+        },
+        "timeseries": {
+            "daily": daily_series
+        },
+        "tops": {
+            "events_by_sales": events_by_sales,
+            "categories_by_sales": categories_by_sales
+        },
+        "inventory": inventory_list
+    }
+
+    _set_cached_analytics(cache_key, response_payload)
+    return response_payload
 
 @admin_router.get("/analytics/sales-by-category")
 def get_sales_by_category(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -1375,6 +1712,7 @@ app.include_router(events_router)
 app.include_router(web3_router)
 app.include_router(metadata_router)
 app.include_router(admin_router)
+app.include_router(organizer_router)
 
 @app.get("/")
 def read_root():

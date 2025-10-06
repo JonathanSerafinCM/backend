@@ -55,10 +55,10 @@ def create_user_and_get_token(db: Session, role: UserRole = UserRole.COMPRADOR, 
     register_data = {"email": email, "password": password, "wallet_address": wallet_address}
     client.post("/auth/register", json=register_data)
     
-    if role == UserRole.ORGANIZADOR:
+    if role in {UserRole.ORGANIZADOR, UserRole.ADMIN}:
         user = db.query(User).filter(User.email == email).first()
         if user:
-            user.role = UserRole.ORGANIZADOR
+            user.role = role
             db.commit()
         
     login_response = client.post("/auth/login", data={"username": email, "password": password})
